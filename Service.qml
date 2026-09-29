@@ -48,6 +48,8 @@ Item {
   property string status: "starting"
   property string message: ""
   property string protectVersion: ""
+  // The address in use when it isn't the home one (e.g. a Tailscale name); "" at home.
+  property string via: ""
   property string daemonVersion: ""
   property var cameras: []
   property var snapshots: ({})   // camera id -> latest snapshot seq
@@ -269,6 +271,7 @@ Item {
       break
     case "status":
       protectVersion = msg.protect ? String(msg.protect) : protectVersion
+      via = msg.via ? String(msg.via) : ""
       setState(String(msg.state), msg.message)
       if (msg.state === "online") _backoff = 2000
       break

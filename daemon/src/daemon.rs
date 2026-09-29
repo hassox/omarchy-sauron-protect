@@ -20,7 +20,7 @@ use crate::config::{self, Config};
 use crate::notify::{Notification, Notifier};
 use crate::private_api::{self, Warmer};
 use crate::proto::{CameraOut, Command, Level, Msg, Out, PROTOCOL, Phase, State};
-use crate::protect::{self, Camera, DeviceItem, EventItem, Frame, Protect, WsStream};
+use crate::protect::{self, Camera, DeviceItem, EventItem, Failure, Frame, Protect, WsStream};
 
 const CONFIG_POLL: Duration = Duration::from_secs(3);
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -29,6 +29,8 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 const DEAD_AFTER: Duration = Duration::from_secs(45);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Route changes arrive in bursts; wait for this much quiet before acting on them.
+const NETWORK_SETTLE: Duration = Duration::from_secs(2);
 const AUTH_BACKOFF: Duration = Duration::from_secs(60);
 const EVENT_IMAGES_KEPT: usize = 50;
 const ENDED_REMEMBERED: usize = 256;
@@ -40,7 +42,10 @@ const EVENT_TYPES: [&str; 6] =
 enum Internal {
     Stdin(Vec<u8>),
     StdinClosed,
-    Status { generation: u64, state: State, message: Option<String>, protect: Option<String> },
+    /// Not online (never `Online`: that comes with its client in `Connected`).
+    Status { generation: u64, state: State, message: String },
+    /// A session is up on `client`'s address.
+    Connected { generation: u64, client: Arc<Protect>, version: String, cameras: Vec<Camera> },
     Cameras { generation: u64, cameras: Vec<Camera> },
     Event { generation: u64, action: String, item: EventItem },
     CameraPatch { generation: u64, item: DeviceItem },
@@ -48,6 +53,8 @@ enum Internal {
     Snapshot { camera: String, tracked: bool, result: Result<u64, String> },
     /// The system resumed from suspend: every connection is suspect.
     Resumed,
+    /// The routing table changed (and then settled): the active address may be wrong now.
+    NetworkChanged,
     Log(Level, String),
 }
 
@@ -107,9 +114,12 @@ impl Filter {
 /// One connection attempt per config load; replaced on reload and resume.
 struct Connection {
     config: Config,
-    client: Arc<Protect>,
+    /// Client for the active address while a session is up.
+    client: Option<Arc<Protect>>,
     /// Keeps a private-API session warm for instant live; `None` when instant live is not set up.
     warmer: Option<Arc<Warmer>>,
+    /// Tells the session the network changed.
+    network: mpsc::UnboundedSender<()>,
     task: JoinHandle<()>,
 }
 
@@ -132,7 +142,8 @@ struct Daemon {
     config_mtime: Option<SystemTime>,
     generation: u64,
     connection: Option<Connection>,
-    status: (State, Option<String>, Option<String>),
+    /// State, message, Protect version, and the active address when it is a fallback.
+    status: (State, Option<String>, Option<String>, Option<String>),
     cameras: HashMap<String, Cam>,
     emitted_cameras: Option<Vec<CamView>>,
     events: HashMap<String, OpenEvent>,
@@ -176,7 +187,7 @@ pub async fn run() -> Result<()> {
         config_mtime: None,
         generation: 0,
         connection: None,
-        status: (State::Connecting, None, None),
+        status: (State::Connecting, None, None, None),
         cameras: HashMap::new(),
         emitted_cameras: None,
         events: HashMap::new(),
@@ -193,7 +204,8 @@ pub async fn run() -> Result<()> {
 
     emit(&mut daemon.out, &Msg::Hello { version: env!("CARGO_PKG_VERSION"), protocol: PROTOCOL }).await;
     daemon.reload(Reload::Startup).await;
-    tokio::spawn(watch_resume(tx));
+    tokio::spawn(watch_resume(tx.clone()));
+    tokio::spawn(watch_network(tx));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -296,15 +308,16 @@ impl Daemon {
         emit(&mut self.out, &Msg::Log { level, message }).await;
     }
 
-    async fn set_status(&mut self, state: State, message: Option<String>, protect: Option<String>) {
-        let status = (state, message, protect);
+    async fn set_status(&mut self, state: State, message: Option<String>, protect: Option<String>, via: Option<String>) {
+        let status = (state, message, protect, via);
         if status == self.status {
             return;
         }
         self.status = status;
-        let (state, message, protect) = &self.status;
-        emit(&mut self.out, &Msg::Status { state: *state, message: message.as_deref(), protect: protect.as_deref() })
-            .await;
+        let (state, message, protect, via) = &self.status;
+        let msg =
+            Msg::Status { state: *state, message: message.as_deref(), protect: protect.as_deref(), via: via.as_deref() };
+        emit(&mut self.out, &msg).await;
     }
 
     fn online(&self) -> bool {
@@ -333,20 +346,16 @@ impl Daemon {
                 config::load(&self.config_path).await.map_err(|err| err.to_string())
             }
         };
-        let started = config.and_then(|config| match Protect::new(&config) {
-            Ok(client) => Ok((config, Arc::new(client))),
-            Err(err) => Err(format!("Config error: {err:#}")),
-        });
-        match started {
-            Ok((config, client)) => {
-                self.set_status(State::Connecting, None, None).await;
-                let warmer = (!config.username.is_empty())
-                    .then(|| Arc::new(Warmer::new(client.clone(), config.username.clone())));
-                let task = tokio::spawn(run_session(self.generation, client.clone(), self.tx.clone()));
-                self.connection = Some(Connection { config, client, warmer, task });
+        match config {
+            Ok(config) => {
+                self.set_status(State::Connecting, None, None, None).await;
+                let warmer = (!config.username.is_empty()).then(|| Arc::new(Warmer::new(config.username.clone())));
+                let (network, network_rx) = mpsc::unbounded_channel();
+                let task = tokio::spawn(run_session(self.generation, config.clone(), self.tx.clone(), network_rx));
+                self.connection = Some(Connection { config, client: None, warmer, network, task });
             }
             Err(message) => {
-                self.set_status(State::Unconfigured, Some(message), None).await;
+                self.set_status(State::Unconfigured, Some(message), None, None).await;
                 self.cameras.clear();
                 self.emit_cameras().await;
             }
@@ -358,24 +367,43 @@ impl Daemon {
             Internal::Stdin(line) => self.command(&line).await,
             // The parent shell is gone.
             Internal::StdinClosed => std::process::exit(0),
-            Internal::Status { generation, state, message, protect } if generation == self.generation => {
-                self.set_status(state, message, protect).await;
+            Internal::Status { generation, state, message } if generation == self.generation => {
+                self.set_status(state, Some(message), None, None).await;
+            }
+            Internal::Connected { generation, client, version, cameras } if generation == self.generation => {
+                let via = client.via().map(str::to_owned);
+                if let Some(connection) = &mut self.connection {
+                    connection.client = Some(client);
+                }
+                self.set_cameras(cameras).await;
+                self.set_status(State::Online, None, Some(version), via).await;
             }
             Internal::Cameras { generation, cameras } if generation == self.generation => {
                 self.set_cameras(cameras).await;
             }
             Internal::Resumed => self.reload(Reload::Resume).await,
+            Internal::NetworkChanged => {
+                if let Some(connection) = &self.connection {
+                    let _ = connection.network.send(());
+                }
+            }
             Internal::Event { generation, action, item } if generation == self.generation => {
                 self.on_event(&action, item).await;
             }
             Internal::CameraPatch { generation, item } if generation == self.generation => {
                 self.patch_cameras(item).await;
             }
-            Internal::Disconnected { generation } if generation == self.generation => self.force_end_all().await,
+            Internal::Disconnected { generation } if generation == self.generation => {
+                if let Some(connection) = &mut self.connection {
+                    connection.client = None;
+                }
+                self.force_end_all().await;
+            }
             Internal::Snapshot { camera, tracked, result } => self.on_snapshot(camera, tracked, result).await,
             Internal::Log(level, message) => self.log(level, &message).await,
             // Stale data from a superseded session.
             Internal::Status { .. }
+            | Internal::Connected { .. }
             | Internal::Cameras { .. }
             | Internal::Event { .. }
             | Internal::CameraPatch { .. }
@@ -501,12 +529,11 @@ impl Daemon {
 
     /// Starts a tracked low-quality refresh unless one is already in flight for the camera.
     fn fetch_snapshot(&mut self, camera: &str) {
-        let Some(connection) = &self.connection else { return };
+        let Some(client) = self.connection.as_ref().and_then(|c| c.client.clone()) else { return };
         if !self.in_flight.insert(camera.to_owned()) {
             return;
         }
-        let (shared, client, tx, camera) =
-            (self.shared.clone(), connection.client.clone(), self.tx.clone(), camera.to_owned());
+        let (shared, tx, camera) = (self.shared.clone(), self.tx.clone(), camera.to_owned());
         tokio::spawn(async move {
             let result = store_snapshot(&shared, &client, &camera, None, &tx, true).await;
             if let Err(err) = result {
@@ -631,6 +658,7 @@ impl Daemon {
     /// runs detached so the `event` line is never delayed.
     fn event_actions(&self, id: &str) {
         let (Some(connection), Some(open)) = (&self.connection, self.events.get(id)) else { return };
+        let Some(client) = connection.client.clone() else { return };
         let camera_name = self.cameras.get(&open.camera).map_or(open.camera.as_str(), |c| c.info.display_name());
         let job = EventJob {
             event_id: id.to_owned(),
@@ -640,8 +668,7 @@ impl Daemon {
             start: open.start,
             desktop: self.filter.desktop,
         };
-        let (shared, client, warmer, tx) =
-            (self.shared.clone(), connection.client.clone(), connection.warmer.clone(), self.tx.clone());
+        let (shared, warmer, tx) = (self.shared.clone(), connection.warmer.clone(), self.tx.clone());
         tokio::spawn(run_event_job(shared, client, warmer, tx, job));
     }
 
@@ -754,7 +781,7 @@ async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, warmer: Option
     }
     // A click on the notification opens live video: have a private-API session ready for it.
     if let Some(warmer) = warmer
-        && let Err(err) = warmer.warm().await
+        && let Err(err) = warmer.warm(&client).await
     {
         let _ = tx.send(Internal::Log(Level::Warn, format!("instant live: {err:#}")));
     }
@@ -825,40 +852,87 @@ async fn prune_event_images(dir: &Path) -> Result<()> {
 
 // ---- connection session ----------------------------------------------------------------------
 
-/// Connects, streams both websockets and reconnects with backoff until aborted.
-async fn run_session(generation: u64, client: Arc<Protect>, tx: Tx) {
+/// Connects to the first address of the console that answers, streams both websockets, and
+/// reconnects with backoff until aborted. A network change (on `network`) cuts a backoff short,
+/// and while online checks whether the active address is still the right one.
+async fn run_session(generation: u64, config: Config, tx: Tx, mut network: mpsc::UnboundedReceiver<()>) {
+    let config = Arc::new(config);
     let mut backoff = BACKOFF_MIN;
+    // The last failure logged in full, so a console that stays away doesn't flood the log.
+    let mut logged = String::new();
     loop {
-        let err = match session_once(generation, &client, &tx, &mut backoff).await {
-            Ok(never) => match never {},
-            Err(err) => err,
+        let (state, message) = match protect::connect(&config).await {
+            Ok((client, version)) => {
+                let client = Arc::new(client);
+                let ended = session_once(generation, &config, &client, version, &tx, &mut network, &mut backoff).await;
+                let _ = tx.send(Internal::Disconnected { generation });
+                let err = match ended {
+                    // A network change: reconnect right away, trying `host` first again.
+                    Ok(()) => continue,
+                    Err(err) => err,
+                };
+                let full = format!("{}: {err:#}", client.address());
+                if full != logged {
+                    let _ = tx.send(Internal::Log(Level::Warn, full.clone()));
+                    logged = full;
+                }
+                if protect::is_auth(&err) {
+                    (State::Auth, format!("{err:#}"))
+                } else {
+                    (State::Offline, protect::failure_message(client.address(), &err))
+                }
+            }
+            Err(err) => {
+                let summary = err.summary();
+                if summary != logged {
+                    for attempt in &err.attempts {
+                        let line = format!("{}: {:#}", attempt.address, attempt.error);
+                        let _ = tx.send(Internal::Log(Level::Warn, line));
+                    }
+                    logged = summary;
+                }
+                let state = match err.failure() {
+                    Failure::Auth => State::Auth,
+                    Failure::Untrusted => State::Unconfigured,
+                    Failure::Offline => State::Offline,
+                };
+                (state, err.to_string())
+            }
         };
-        let _ = tx.send(Internal::Disconnected { generation });
-        let (state, wait) = if protect::is_auth(&err) {
-            (State::Auth, AUTH_BACKOFF)
+        let wait = if state == State::Auth {
+            AUTH_BACKOFF
         } else {
             let wait = backoff;
             backoff = (backoff * 2).min(BACKOFF_MAX);
-            (State::Offline, wait)
+            wait
         };
-        let _ = tx.send(Internal::Status { generation, state, message: Some(format!("{err:#}")), protect: None });
-        sleep(wait).await;
+        let _ = tx.send(Internal::Status { generation, state, message });
+        tokio::select! {
+            () = sleep(wait) => {}
+            Some(()) = network.recv() => {
+                while network.try_recv().is_ok() {}
+                backoff = BACKOFF_MIN;
+            }
+        }
     }
 }
 
+/// One session on `client`'s address. `Ok(())`: a network change calls for reconnecting now.
 async fn session_once(
     generation: u64,
+    config: &Arc<Config>,
     client: &Arc<Protect>,
+    version: String,
     tx: &Tx,
+    network: &mut mpsc::UnboundedReceiver<()>,
     backoff: &mut Duration,
-) -> Result<std::convert::Infallible> {
-    let version = client.version().await?;
+) -> Result<()> {
     let cameras = client.cameras().await?;
     let (mut events, mut devices) = tokio::try_join!(client.subscribe("events"), client.subscribe("devices"))?;
 
     let mut background = JoinSet::new();
-    let _ = tx.send(Internal::Cameras { generation, cameras });
-    let _ = tx.send(Internal::Status { generation, state: State::Online, message: None, protect: Some(version) });
+    let mut checks = JoinSet::new();
+    let _ = tx.send(Internal::Connected { generation, client: client.clone(), version, cameras });
     *backoff = BACKOFF_MIN;
 
     let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
@@ -896,9 +970,29 @@ async fn session_once(
             }
             () = sleep_until(events_seen + DEAD_AFTER) => bail!("events websocket silent for {}s", DEAD_AFTER.as_secs()),
             () = sleep_until(devices_seen + DEAD_AFTER) => bail!("devices websocket silent for {}s", DEAD_AFTER.as_secs()),
+            Some(()) = network.recv(), if checks.is_empty() => {
+                checks.spawn(needs_reconnect(config.clone(), client.clone()));
+            }
+            Some(reconnect) = checks.join_next() => {
+                if reconnect.unwrap_or(false) {
+                    return Ok(());
+                }
+            }
             Some(_) = background.join_next() => {}
         }
     }
+}
+
+/// After a network change while online: on a fallback, go home as soon as `host` answers as our
+/// console (pinned, 3 s); otherwise reconnect only if the active address stopped answering.
+async fn needs_reconnect(config: Arc<Config>, client: Arc<Protect>) -> bool {
+    if client.via().is_some()
+        && let Ok(home) = Protect::new(&config, &config.host)
+        && home.alive().await.is_ok()
+    {
+        return true;
+    }
+    client.alive().await.is_err()
 }
 
 /// Unwraps a websocket read: `Some(text)` for text frames, `None` for control/binary frames.
@@ -927,6 +1021,52 @@ async fn refetch_cameras(generation: u64, client: Arc<Protect>, tx: Tx) {
             let _ = tx.send(Internal::Log(Level::Warn, format!("refreshing cameras: {err:#}")));
         }
     }
+}
+
+/// Reports `NetworkChanged` each time the routing table changes and then stays quiet for
+/// `NETWORK_SETTLE`, from an `ip -o monitor route` child. Without `ip`, logs one warning.
+async fn watch_network(tx: Tx) {
+    if let Err(err) = watch_network_inner(&tx).await {
+        let _ = tx.send(Internal::Log(Level::Warn, format!("cannot watch for network changes: {err:#}")));
+    }
+}
+
+async fn watch_network_inner(tx: &Tx) -> Result<()> {
+    let mut command = tokio::process::Command::new("ip");
+    command
+        .args(["-o", "monitor", "route"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    // SAFETY: the closure only calls prctl(2), which is async-signal-safe. The watcher must not
+    // outlive the daemon, which leaves through `exit` without dropping it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().context("cannot run `ip monitor route`")?;
+    let stdout = child.stdout.take().context("`ip monitor` has no stdout")?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut settle: Option<Instant> = None;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line.context("reading `ip monitor`")? {
+                Some(_) => settle = Some(Instant::now() + NETWORK_SETTLE),
+                None => break,
+            },
+            () = sleep_until(settle.unwrap_or_else(Instant::now)), if settle.is_some() => {
+                settle = None;
+                if tx.send(Internal::NetworkChanged).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let status = child.wait().await?;
+    bail!("`ip monitor route` exited ({status})")
 }
 
 /// Reports `Resumed` after each suspend: logind's `PrepareForSleep(false)` on the system bus.

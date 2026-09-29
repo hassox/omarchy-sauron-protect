@@ -7,11 +7,10 @@
 //!   to `X-CSRF-Token`, sent back as `X-CSRF-Token`. 401 = bad credentials, 499 with
 //!   `MFA_AUTH_REQUIRED` = MFA, 429 = too many attempts.
 //! - `GET /proxy/protect/api/ws/livestream?…` answers `{"url": "wss://…"}`; the URL carries its own
-//!   token, and its hostname may be internal, so it is replaced with the configured host.
+//!   token, and its hostname may be internal, so it is replaced with the active console address.
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -152,7 +151,7 @@ pub struct PrivateApi<'a> {
 
 impl<'a> PrivateApi<'a> {
     pub fn new(protect: &'a Protect, username: &str, password: String) -> Self {
-        Self { protect, host: protect.console_id(), username: username.to_owned(), password, session: None }
+        Self { protect, host: protect.console_id().to_owned(), username: username.to_owned(), password, session: None }
     }
 
     /// Logs in now, ignoring any pause (an explicit user action), and caches the session.
@@ -272,7 +271,7 @@ impl<'a> PrivateApi<'a> {
         csrf_header(response.headers())
     }
 
-    /// The websocket URL for a camera's livestream, host rewritten to the configured console.
+    /// The websocket URL for a camera's livestream, host rewritten to the active console address.
     /// Logs in again once if the cached session has expired.
     pub async fn livestream_url(&mut self, camera: &str, channel: u8) -> Result<String> {
         let mut url = Url::parse(&format!("{}{LIVESTREAM_PATH}", self.protect.origin()))?;
@@ -364,24 +363,23 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// Keeps a private-API session cached for the daemon, so clicking an alert starts video
 /// without a login round trip. Re-created on every config reload.
 pub struct Warmer {
-    client: Arc<Protect>,
     username: String,
     password: OnceCell<Option<String>>,
     busy: Mutex<()>,
 }
 
 impl Warmer {
-    pub fn new(client: Arc<Protect>, username: String) -> Self {
-        Self { client, username, password: OnceCell::new(), busy: Mutex::new(()) }
+    pub fn new(username: String) -> Self {
+        Self { username, password: OnceCell::new(), busy: Mutex::new(()) }
     }
 
-    /// Logs in unless a session is cached; quiet when instant live is unconfigured or paused.
-    pub async fn warm(&self) -> Result<()> {
+    /// Logs in through `client` (the active address) unless a session is cached; quiet when
+    /// instant live is unconfigured or paused.
+    pub async fn warm(&self, client: &Protect) -> Result<()> {
         let _busy = self.busy.lock().await;
-        let console = self.client.console_id();
-        let password = self.password.get_or_init(|| keyring::lookup(&console, &self.username)).await;
+        let password = self.password.get_or_init(|| keyring::lookup(client.console_id(), &self.username)).await;
         let Some(password) = password else { return Ok(()) };
-        let mut api = PrivateApi::new(&self.client, &self.username, password.clone());
+        let mut api = PrivateApi::new(client, &self.username, password.clone());
         match api.session().await {
             Ok(_) | Err(LoginError::Paused { .. }) => Ok(()),
             Err(err) => Err(err.into()),

@@ -1,8 +1,8 @@
 //! Mock UniFi Protect console for end-to-end testing without cameras: the Integration API, the
 //! UniFi OS login and Protect's private livestream.
 //!
-//! `cargo run --example mock_protect -- [--port 7447] [--interval 20] [--scenes DIR]`, then point sauron at
-//! `host = "http://127.0.0.1:7447"` with `api_key = "mock"`; the UniFi OS user is `sauron` with
+//! `cargo run --example mock_protect -- [--port 7447] [--bind 127.0.0.1] [--interval 20] [--scenes DIR]`,
+//! then point sauron at `host = "http://127.0.0.1:7447"` with `api_key = "mock"`; the UniFi OS user is `sauron` with
 //! password `mock` (user `mfa`, same password, behaves like an account with MFA enabled).
 //! `curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'` fires an event;
 //! `POST /mock/livestream?fail=true|false` breaks or repairs the livestream endpoint;
@@ -218,6 +218,7 @@ fn now_ms() -> u64 {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let mut port: u16 = 7447;
+    let mut bind = String::from("127.0.0.1");
     let mut interval_secs: u64 = 20;
     let mut scenes = None;
     let mut args = std::env::args().skip(1);
@@ -228,8 +229,9 @@ async fn main() -> io::Result<()> {
             ("--port", Some(v)) => port = u16::try_from(v).map_err(io::Error::other)?,
             ("--interval", Some(v)) if v > 0 => interval_secs = v,
             ("--scenes", _) if value.is_some() => scenes = value.map(std::path::PathBuf::from),
+            ("--bind", _) if value.is_some() => bind = value.unwrap_or_default(),
             _ => {
-                eprintln!("usage: mock_protect [--port 7447] [--interval 20] [--scenes DIR]");
+                eprintln!("usage: mock_protect [--port 7447] [--bind 127.0.0.1] [--interval 20] [--scenes DIR]");
                 std::process::exit(2);
             }
         }
@@ -252,9 +254,9 @@ async fn main() -> io::Result<()> {
         port,
         livestreams: Mutex::new(HashMap::new()),
     });
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = TcpListener::bind((bind.as_str(), port)).await?;
     eprintln!(
-        "mock: Protect on http://127.0.0.1:{port} (api key \"{API_KEY}\", events every {interval_secs}s, drawtext {})",
+        "mock: Protect on http://{bind}:{port} (api key \"{API_KEY}\", events every {interval_secs}s, drawtext {})",
         if mock.drawtext { "on" } else { "off" }
     );
 

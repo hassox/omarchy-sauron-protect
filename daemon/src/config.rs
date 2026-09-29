@@ -8,29 +8,38 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
+use crate::protect;
+use crate::tls::Fingerprint;
+
 const DEFAULT_PLAYER: [&str; 5] = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-window=immediate"];
 
 /// Validated configuration with the API key already resolved.
 #[derive(Clone)]
 pub struct Config {
+    /// The console's identity (keyring, session cache) and first address to try.
     pub host: String,
+    /// Other addresses of the same console, tried in order after `host`.
+    pub fallback_hosts: Vec<String>,
+    /// The console's leaf certificate; `None` trusts webpki roots instead.
+    pub cert_sha256: Option<Fingerprint>,
     pub api_key: String,
     /// Local UniFi OS user for instant live; empty when instant live is not set up.
     pub username: String,
-    pub verify_tls: bool,
     pub live_quality: String,
     pub player: Vec<String>,
 }
 
-/// The config file as written, before validation.
+/// The config file as written, before validation. Unknown keys (such as the old `verify_tls`)
+/// are ignored.
 #[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
     pub host: String,
+    pub fallback_hosts: Vec<String>,
+    pub cert_sha256: String,
     pub api_key: String,
     pub api_key_command: String,
     pub username: String,
-    pub verify_tls: bool,
     pub live_quality: String,
     pub player: Vec<String>,
 }
@@ -39,10 +48,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             host: String::new(),
+            fallback_hosts: Vec::new(),
+            cert_sha256: String::new(),
             api_key: String::new(),
             api_key_command: String::new(),
             username: String::new(),
-            verify_tls: false,
             live_quality: "high".into(),
             player: DEFAULT_PLAYER.map(String::from).to_vec(),
         }
@@ -119,10 +129,24 @@ impl Settings {
     /// Checks the values and resolves the API key.
     pub async fn validate(self) -> Result<Config, LoadError> {
         let invalid = |message: String| Err(LoadError::Invalid(message));
-        let host = self.host.trim().trim_end_matches('/').to_owned();
+        let host = address(&self.host);
         if host.is_empty() {
             return invalid("`host` is empty".into());
         }
+        let fallback_hosts: Vec<String> =
+            self.fallback_hosts.iter().map(|a| address(a)).filter(|a| !a.is_empty()).collect();
+        for candidate in std::iter::once(&host).chain(&fallback_hosts) {
+            if let Err(err) = protect::base_url(candidate) {
+                return invalid(format!("{err:#}"));
+            }
+        }
+        let cert_sha256 = match self.cert_sha256.trim() {
+            "" => None,
+            pin => match Fingerprint::parse(pin) {
+                Some(pin) => Some(pin),
+                None => return invalid("`cert_sha256` must be a SHA-256 fingerprint (64 hex digits)".into()),
+            },
+        };
         if !matches!(self.live_quality.as_str(), "high" | "medium" | "low") {
             return invalid(format!("`live_quality` must be high, medium or low, not {:?}", self.live_quality));
         }
@@ -139,13 +163,19 @@ impl Settings {
         };
         Ok(Config {
             host,
+            fallback_hosts,
+            cert_sha256,
             api_key,
             username: self.username.trim().to_owned(),
-            verify_tls: self.verify_tls,
             live_quality: self.live_quality,
             player: self.player,
         })
     }
+}
+
+/// A console address as configured: trimmed, without a trailing slash.
+pub fn address(text: &str) -> String {
+    text.trim().trim_end_matches('/').to_owned()
 }
 
 async fn run_key_command(command: &str) -> Result<String> {
@@ -173,32 +203,44 @@ async fn run_key_command(command: &str) -> Result<String> {
 /// The commented config file with `settings` filled in.
 fn render(settings: &Settings) -> String {
     let string = |s: &str| toml::Value::String(s.to_owned()).to_string();
-    let player = toml::Value::Array(settings.player.iter().map(|arg| toml::Value::String(arg.clone())).collect());
+    let array = |items: &[String]| toml::Value::Array(items.iter().map(|s| toml::Value::String(s.clone())).collect());
+    let fallback_hosts: Vec<String> =
+        settings.fallback_hosts.iter().map(|a| address(a)).filter(|a| !a.is_empty()).collect();
+    let cert_sha256 = match Fingerprint::parse(&settings.cert_sha256) {
+        Some(pin) => pin.to_string(),
+        None => settings.cert_sha256.trim().to_owned(),
+    };
     let key_command = match settings.api_key_command.trim() {
         "" => "# api_key_command = \"\"".to_owned(),
         command => format!("api_key_command = {}", string(command)),
     };
     format!(
-        "# UniFi console address: IP or hostname (https assumed). A full URL (http://host:port) is accepted for testing.
+        "# UniFi console address: IP or hostname (https assumed). Also its identity for the keyring.
+# A full URL (http://host:port) is for testing only: plain http has no TLS.
 host = {host}
+# Other addresses of the same console, tried in order after host, e.g. [\"100.101.102.103\", \"unifi.tail1234.ts.net\"]
+fallback_hosts = {fallback_hosts}
+# SHA-256 of the console's certificate as openssl prints it, e.g. \"AB:CD:EF:…\"; sauron setup fills it in.
+# Only that certificate is accepted, at every address. Empty = require a publicly trusted certificate.
+cert_sha256 = {cert_sha256}
 # Protect › Settings › Control Plane › Integrations › Create API key
 api_key = {api_key}
 # Alternative to api_key: a command whose stdout is the key, e.g. \"secret-tool lookup service sauron\"
 {key_command}
 # Local UniFi OS user for instant live video; its password lives in the keyring. Empty = RTSPS only.
 username = {username}
-# UniFi consoles ship self-signed certificates; set true only if yours has a valid one.
-verify_tls = {verify_tls}
 # Live view quality: high | medium | low
 live_quality = {live_quality}
 # Player argv; \"--title=<Sauron · camera>\" (mpv only) and the stream URL (or \"-\" for instant live) are appended.
 player = {player}
 ",
-        host = string(settings.host.trim()),
+        host = string(&address(&settings.host)),
+        fallback_hosts = array(&fallback_hosts),
+        cert_sha256 = string(&cert_sha256),
         api_key = string(settings.api_key.trim()),
         username = string(settings.username.trim()),
-        verify_tls = settings.verify_tls,
         live_quality = string(&settings.live_quality),
+        player = array(&settings.player),
     )
 }
 

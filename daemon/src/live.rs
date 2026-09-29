@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::private_api::{self, PrivateApi};
 use crate::protect::{self, Camera, Protect};
 use crate::{hypr, keyring};
@@ -21,8 +21,7 @@ use crate::{hypr, keyring};
 const LIVESTREAM_SILENCE: Duration = Duration::from_secs(10);
 
 pub async fn run(query: &str) -> Result<()> {
-    let config = config::load(&config::config_path()).await?;
-    let client = Protect::new(&config)?;
+    let (config, client, _) = crate::connect().await?;
     let cameras = crate::sorted_cameras(&client).await?;
     let camera = crate::resolve(&cameras, query)?;
     let title = format!("Sauron · {}", camera.display_name());
@@ -53,7 +52,7 @@ async fn focus_open_viewer(title: &str) -> Result<bool> {
 /// Plays the private livestream. `Ok(false)`: no password in the keyring, so instant live is
 /// not set up. `Err`: failed before any video reached the player, so RTSPS should take over.
 async fn instant(config: &Config, client: &Protect, camera: &Camera, title: &str) -> Result<bool> {
-    let Some(password) = keyring::lookup(&client.console_id(), &config.username).await else {
+    let Some(password) = keyring::lookup(client.console_id(), &config.username).await else {
         return Ok(false);
     };
     let mut api = PrivateApi::new(client, &config.username, password);

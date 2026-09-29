@@ -8,13 +8,14 @@ mod private_api;
 mod proto;
 mod protect;
 mod setup;
+mod tls;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 
-use crate::protect::{Camera, Protect};
+use crate::protect::{Camera, ConnectError, Failure, Outcome, Protect};
 
 const USAGE: &str = "\
 sauron — UniFi Protect bridge for the Omarchy bar
@@ -39,8 +40,8 @@ async fn main() -> ExitCode {
     let result = match args.as_slice() {
         ["setup"] => return setup::run().await,
         ["watch"] => daemon::run().await,
-        ["check"] => list_cameras(true).await,
-        ["cameras"] => list_cameras(false).await,
+        ["check"] => check().await,
+        ["cameras"] => cameras().await,
         ["live", camera] => live::run(camera).await,
         ["snapshot", camera] => snapshot(camera, None).await,
         ["snapshot", camera, out] => snapshot(camera, Some(out)).await,
@@ -66,10 +67,11 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn connect() -> Result<(config::Config, Protect)> {
+/// Loads the config and connects to the first address of the console that answers.
+pub async fn connect() -> Result<(config::Config, Protect, String)> {
     let config = config::load(&config::config_path()).await?;
-    let client = Protect::new(&config)?;
-    Ok((config, client))
+    let (client, version) = protect::connect(&config).await?;
+    Ok((config, client, version))
 }
 
 pub async fn sorted_cameras(client: &Protect) -> Result<Vec<Camera>> {
@@ -78,17 +80,55 @@ pub async fn sorted_cameras(client: &Protect) -> Result<Vec<Camera>> {
     Ok(cameras)
 }
 
-async fn list_cameras(header: bool) -> Result<()> {
-    let (config, client) = connect().await?;
-    if header {
-        let version = client.version().await.with_context(|| format!("Protect at {}", config.host))?;
-        println!("Protect {version} at {}", config.host);
-    }
-    for camera in sorted_cameras(&client).await? {
+async fn cameras() -> Result<()> {
+    list_cameras(&connect().await?.1).await
+}
+
+async fn list_cameras(client: &Protect) -> Result<()> {
+    for camera in sorted_cameras(client).await? {
         let state = if camera.online() { "online" } else { "offline" };
         println!("{state}\t{}\t{}\t{}", camera.display_name(), camera.model(), camera.id);
     }
     Ok(())
+}
+
+/// `Protect <v> at <address> (<security>)` and the cameras, or one line per address tried.
+async fn check() -> Result<()> {
+    let config = config::load(&config::config_path()).await?;
+    let (client, version) = match protect::connect(&config).await {
+        Ok(connected) => connected,
+        Err(err) => return Err(report(&err)),
+    };
+    let via = if client.via().is_some() { " via fallback" } else { "" };
+    println!("Protect {version} at {} ({}){via}", client.address(), client.security());
+    list_cameras(&client).await
+}
+
+/// Prints each failed address with its outcome; returns the overall error.
+fn report(err: &ConnectError) -> anyhow::Error {
+    for attempt in &err.attempts {
+        let detail = match attempt.outcome {
+            Outcome::NoAnswer | Outcome::Other(_) => format!(" ({})", root_cause(&attempt.error)),
+            _ => String::new(),
+        };
+        eprintln!("✗ {}: {}{detail}", attempt.address, attempt.outcome);
+    }
+    match err.failure() {
+        Failure::Offline => anyhow::anyhow!("cannot connect to the console"),
+        Failure::Auth | Failure::Untrusted => anyhow::anyhow!("{err}"),
+    }
+}
+
+/// The innermost cause, looking inside transport errors: "Connection refused (os error 111)".
+fn root_cause(err: &anyhow::Error) -> String {
+    let mut cause: &(dyn std::error::Error + 'static) = err.root_cause();
+    if let Some(transport) = cause.downcast_ref::<protect::Transport>() {
+        cause = transport.inner();
+        while let Some(source) = cause.source() {
+            cause = source;
+        }
+    }
+    cause.to_string()
 }
 
 /// Finds a camera by id, case-insensitive name, or unique case-insensitive name prefix.
@@ -114,7 +154,7 @@ pub fn resolve<'a>(cameras: &'a [Camera], query: &str) -> Result<&'a Camera> {
 
 /// Saves the best snapshot the camera offers (full HD only where its feature flags allow it).
 async fn snapshot(query: &str, out: Option<&str>) -> Result<()> {
-    let (_, client) = connect().await?;
+    let (_, client, _) = connect().await?;
     let cameras = sorted_cameras(&client).await?;
     let camera = resolve(&cameras, query)?;
     let path = match out {

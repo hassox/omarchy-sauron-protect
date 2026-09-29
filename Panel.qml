@@ -59,7 +59,7 @@ Panel {
     case "outdated": return "Daemon out of date"
     case "unconfigured": return "Not set up"
     case "auth": return "API key rejected"
-    case "offline": return "Can't reach Protect"
+    case "offline": return "Can't reach your console"
     default: return ""
     }
   }
@@ -68,8 +68,8 @@ Panel {
     case "missing": return "Install"
     case "outdated": return "Update"
     case "unconfigured":
-    case "auth":
-    case "offline": return "Set up"
+    case "auth": return "Set up"
+    case "offline": return "Retry"
     default: return ""
     }
   }
@@ -82,16 +82,25 @@ Panel {
     return ""
   }
 
-  readonly property string heroMeta: online ? (alerting ? alertText : (dnd ? "Do Not Disturb" : "")) : statusTitle
+  readonly property string via: sauron ? sauron.via : ""
+
+  readonly property string heroMeta: {
+    if (!online) return statusTitle
+    if (alerting) return alertText
+    if (dnd) return "Do Not Disturb"
+    return via !== "" ? "via " + via : ""
+  }
 
   readonly property string tooltip: {
     if (!online) return "Sauron" + (statusTitle !== "" ? " · " + statusTitle : "")
     if (alerting) return alertText
-    return "Sauron · " + (sauron ? sauron.onlineCount : 0) + "/" + cameras.length + " cameras" + (silenced ? " · silenced" : "")
+    return "Sauron · " + (sauron ? sauron.onlineCount : 0) + "/" + cameras.length + " cameras"
+      + (via !== "" ? " · via " + via : "") + (silenced ? " · silenced" : "")
   }
 
   function runAction() {
     if (!sauron || actionLabel === "") return
+    if (status === "offline") { sauron.reload(); return }
     close()
     if (status === "missing" || status === "outdated") sauron.install()
     else sauron.setup()
@@ -116,7 +125,7 @@ Panel {
     if (actionLabel !== "") list.push("action")
     if (online && kinds.length > 0) list.push("kinds")
     if (online) list.push("silence")
-    if (cameras.length > 0) list.push("tiles")
+    if (online && cameras.length > 0) list.push("tiles")
     if (recent.length > 0) list.push("events")
     return list
   }
@@ -224,7 +233,7 @@ Panel {
   // The panel holds keyboard focus while open, and Hyprland won't hand focus
   // to a window that maps underneath it. Close first so the player gets focus.
   function showCamera(id) {
-    if (!sauron || !id) return
+    if (!sauron || !id || !online) return
     close()
     sauron.openLive(id)
   }
@@ -462,13 +471,13 @@ Panel {
 
           // ---------- Cameras ----------
           PanelSeparator {
-            visible: root.cameras.length > 0
+            visible: root.online && root.cameras.length > 0
             foreground: root.foreground
           }
 
           Grid {
             id: grid
-            visible: root.cameras.length > 0
+            visible: root.online && root.cameras.length > 0
             columns: root.columns
             spacing: root.gridGap
 

@@ -53,6 +53,8 @@ pub enum Msg<'a> {
         state: State,
         message: Option<&'a str>,
         protect: Option<&'a str>,
+        /// The active address when it is a fallback, not `host`; `null` otherwise.
+        via: Option<&'a str>,
     },
     Cameras {
         cameras: Vec<CameraOut<'a>>,

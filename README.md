@@ -46,11 +46,12 @@ To update, run `omarchy plugin update sauron`, then run `install.sh` again so th
 
 ## Set up
 
-Run `sauron setup`, or click the eye and then **Set up**. The wizard asks for three things:
+Run `sauron setup`, or click the eye and then **Set up**. The wizard asks for:
 
-1. **Your console's address.** It suggests your network's gateway, which is usually the console.
+1. **Your console's address.** It suggests your network's gateway, which is usually the console. Sauron then shows the console's certificate and asks you to trust it (see [Away from home](#away-from-home)).
 2. **A Protect API key.** Create one in UniFi Protect under **Settings › Control Plane › Integrations › Create API Key**.
-3. **Instant live video (optional).** See below.
+3. **Other addresses (optional).** How the console can be reached when you're not at home, such as its Tailscale name.
+4. **Instant live video (optional).** See below.
 
 Re-run `sauron setup` any time to change something; your current answers are the defaults. The eye picks up the changes within a few seconds.
 
@@ -66,6 +67,17 @@ The Protect app starts feeds almost instantly with a different stream that needs
 4. Leave multi-factor authentication off.
 
 Then enter its username and password in `sauron setup`. The password is stored in your GNOME keyring, not in a file. If that stream ever fails, Sauron falls back to RTSPS.
+
+### Away from home
+
+Sauron needs to reach your console, so away from home it needs a way back to your network:
+
+- **Tailscale.** Run a [subnet router](https://tailscale.com/kb/1019/subnets) at home that advertises your home network, and run `tailscale up --accept-routes` on your laptop. Your console's usual address then works from anywhere. If you reach the console under a different name or IP instead, add it under **Other addresses** in `sauron setup`.
+- **UniFi's WireGuard VPN.** In UniFi Network, go to **Settings › VPN › VPN Server**, create a WireGuard server, and import its client file with `nmcli connection import type wireguard file <file>.conf`. (UniFi Teleport also uses WireGuard, but it has no Linux app.)
+
+Without either, the eye shows **Can't reach your console**. It reconnects on its own within a few seconds of your network changing or a VPN connecting, or you can click **Retry**. Detections that happen while you're disconnected aren't recorded, because Protect keeps no history for Sauron to fetch.
+
+**Your credentials only go to your console.** During setup, Sauron records your console's certificate. From then on it won't talk to anything that presents a different certificate: a café router that happens to use the same address as your console gets a failed connection, never your API key or password. If your console's certificate ever changes, re-run `sauron setup` from home.
 
 ## Use
 
@@ -153,13 +165,16 @@ omarchy bar set sauron recentSightings 10 --json
 Connection settings live in `~/.config/sauron/config.toml`, which `sauron setup` writes:
 
 ```toml
-host = "192.168.1.1"      # your UniFi console
+host = "192.168.1.1"      # your UniFi console at home
+fallback_hosts = []       # other addresses for the same console, e.g. ["unifi.tail1234.ts.net"]
+cert_sha256 = "AB:CD:…"   # the console's certificate, recorded by sauron setup
 api_key = "…"             # or api_key_command = "secret-tool lookup service sauron"
 username = "sauron"       # service account for instant live; its password is in your keyring
-verify_tls = false        # consoles ship self-signed certificates; set true if yours has a real one
 live_quality = "high"     # high | medium | low
 player = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-window=immediate"]
 ```
+
+If your console has a certificate from a public authority (for example on your own domain), leave `cert_sha256` out and Sauron verifies it normally.
 
 ## Troubleshooting
 
@@ -168,6 +183,7 @@ player = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-wi
 - **Read the logs** with `journalctl --user -g 'sauron:'`.
 - **Live video takes a few seconds to start.** Set up [instant live video](#instant-live-video-optional).
 - **Instant live keeps falling back.** Re-run `sauron setup` and re-enter the service account. Sauron pauses its logins for 15 minutes after a rejected password so it can't get the account locked out.
+- **"Can't reach your console" at home.** If the panel says the address is *not your console*, the console's certificate has changed; re-run `sauron setup`.
 
 ## How it works
 
