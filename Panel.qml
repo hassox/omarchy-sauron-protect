@@ -52,32 +52,49 @@ Panel {
     ? Kinds.describe(sauron.alertKinds) + " · " + sauron.cameraName(sauron.alertCamera)
     : ""
 
-  readonly property string heroMeta: online ? (alerting ? alertText : (dnd ? "Do Not Disturb" : "")) : ""
-
-  readonly property string attentionText: {
-    if (!sauron) return ""
+  // Not connected: one short status line and the one thing that fixes it.
+  readonly property string statusTitle: {
     switch (status) {
-    case "missing": return "Build and install the sauron daemon:\n" + sauron.message
-    case "unconfigured": return (sauron.message !== "" ? sauron.message + "\n" : "") + "Add your console host and a Protect API key (Protect › Settings › Control Plane › Integrations)."
-    case "auth": return "Protect rejected the API key. Check api_key in ~/.config/sauron/config.toml."
-    case "offline": return sauron.message
-    case "outdated": return sauron.message
+    case "missing": return "Daemon not installed"
+    case "outdated": return "Daemon out of date"
+    case "unconfigured": return "Not set up"
+    case "auth": return "API key rejected"
+    case "offline": return "Can't reach Protect"
     default: return ""
     }
   }
+  readonly property string actionLabel: {
+    switch (status) {
+    case "missing": return "Install"
+    case "outdated": return "Update"
+    case "unconfigured":
+    case "auth":
+    case "offline": return "Set up"
+    default: return ""
+    }
+  }
+  // The daemon's own words only where they say something the title doesn't:
+  // a network error, or a config the wizard didn't write.
+  readonly property string statusDetail: {
+    if (!sauron) return ""
+    if (status === "offline") return sauron.message
+    if (status === "unconfigured" && sauron.message.indexOf("Not set up") !== 0) return sauron.message
+    return ""
+  }
+
+  readonly property string heroMeta: online ? (alerting ? alertText : (dnd ? "Do Not Disturb" : "")) : statusTitle
 
   readonly property string tooltip: {
-    switch (status) {
-    case "missing": return "Sauron · daemon not installed"
-    case "unconfigured": return "Sauron · not configured"
-    case "auth": return "Sauron · API key rejected"
-    case "offline": return "Sauron · offline"
-    case "outdated": return "Sauron · daemon out of date"
-    case "online":
-      if (alerting) return alertText
-      return "Sauron · " + (sauron ? sauron.onlineCount : 0) + "/" + cameras.length + " cameras" + (silenced ? " · silenced" : "")
-    default: return "Sauron · connecting"
-    }
+    if (!online) return "Sauron" + (statusTitle !== "" ? " · " + statusTitle : "")
+    if (alerting) return alertText
+    return "Sauron · " + (sauron ? sauron.onlineCount : 0) + "/" + cameras.length + " cameras" + (silenced ? " · silenced" : "")
+  }
+
+  function runAction() {
+    if (!sauron || actionLabel === "") return
+    close()
+    if (status === "missing" || status === "outdated") sauron.install()
+    else sauron.setup()
   }
 
   // ------------------------------------------------------------ grid geometry
@@ -96,6 +113,7 @@ Panel {
   ]
   readonly property var sections: {
     var list = []
+    if (actionLabel !== "") list.push("action")
     if (online && kinds.length > 0) list.push("kinds")
     if (online) list.push("silence")
     if (cameras.length > 0) list.push("tiles")
@@ -110,6 +128,7 @@ Panel {
   property int eventIndex: 0
 
   function sectionSize(name) {
+    if (name === "action") return 1
     if (name === "kinds") return kinds.length
     if (name === "silence") return silenceOptions.length
     if (name === "tiles") return cameras.length
@@ -121,7 +140,8 @@ Panel {
     if (name === "kinds") return kindIndex
     if (name === "silence") return silenceIndex
     if (name === "tiles") return tileIndex
-    return eventIndex
+    if (name === "events") return eventIndex
+    return 0
   }
 
   function setIndex(name, i) {
@@ -130,7 +150,7 @@ Panel {
     if (name === "kinds") kindIndex = v
     else if (name === "silence") silenceIndex = v
     else if (name === "tiles") tileIndex = v
-    else eventIndex = v
+    else if (name === "events") eventIndex = v
   }
 
   function setCursor(name, i) {
@@ -184,10 +204,11 @@ Panel {
 
   function activateCursor() {
     if (!sauron) return
-    if (section === "kinds") sauron.toggleKind(kinds[kindIndex])
+    if (section === "action") runAction()
+    else if (section === "kinds") sauron.toggleKind(kinds[kindIndex])
     else if (section === "silence") chooseSilence(silenceOptions[silenceIndex])
     else if (section === "tiles") openCamera(tileIndex)
-    else if (section === "events" && recent[eventIndex]) sauron.openLive(recent[eventIndex].camera)
+    else if (section === "events" && recent[eventIndex]) showCamera(recent[eventIndex].camera)
   }
 
   function chooseSilence(option) {
@@ -197,7 +218,15 @@ Panel {
   }
 
   function openCamera(i) {
-    if (sauron && cameras[i]) sauron.openLive(cameras[i].id)
+    if (cameras[i]) showCamera(cameras[i].id)
+  }
+
+  // The panel holds keyboard focus while open, and Hyprland won't hand focus
+  // to a window that maps underneath it. Close first so the player gets focus.
+  function showCamera(id) {
+    if (!sauron || !id) return
+    close()
+    sauron.openLive(id)
   }
 
   function scrollIntoView(item) {
@@ -259,7 +288,11 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      // Enter with no cursor yet goes straight to the fix when there is one.
+      onActivateRequested: {
+        if (root.cursorActive) root.activateCursor()
+        else root.runAction()
+      }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
@@ -314,27 +347,33 @@ Panel {
             }
           }
 
-          BorderSurface {
-            visible: root.attentionText !== ""
+          Column {
+            visible: root.actionLabel !== ""
             width: parent.width
-            implicitHeight: attention.implicitHeight + Style.spacing.xl * 2
-            color: Util.alpha(root.urgent, 0.10)
-            borderSpec: Border.flat(Util.alpha(root.urgent, 0.35), 1)
-            radius: Style.cornerRadius
+            spacing: Style.spacing.lg
 
             Text {
-              id: attention
+              visible: root.statusDetail !== ""
+              width: parent.width
               textFormat: Text.PlainText
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              text: root.attentionText
-              color: root.foreground
+              text: root.statusDetail
+              color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+            }
+
+            Button {
+              text: root.actionLabel
+              selected: true
+              bordered: true
+              hasCursor: root.cursorActive && root.section === "action"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              horizontalPadding: Style.space(18)
+              onClicked: root.runAction()
+              onHovered: function(isHovered) { if (isHovered) root.setCursor("action", 0) }
             }
           }
 
@@ -629,7 +668,7 @@ Panel {
       onClicked: function(mouse) {
         if (!root.sauron) return
         if (mouse.button === Qt.RightButton) root.sauron.toggleMuted(tile.modelData.id)
-        else root.sauron.openLive(tile.modelData.id)
+        else root.showCamera(tile.modelData.id)
       }
     }
   }
@@ -703,7 +742,7 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onEntered: root.setCursor("events", row.index)
-      onClicked: if (root.sauron) root.sauron.openLive(row.modelData.camera)
+      onClicked: root.showCamera(row.modelData.camera)
     }
   }
 }

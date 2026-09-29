@@ -1,9 +1,13 @@
 mod config;
 mod daemon;
+mod hypr;
+mod keyring;
 mod live;
 mod notify;
+mod private_api;
 mod proto;
 mod protect;
+mod setup;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,12 +20,12 @@ const USAGE: &str = "\
 sauron — UniFi Protect bridge for the Omarchy bar
 
 usage:
+  sauron setup                      set up (or change) the console, API key and instant live
   sauron watch                      run the daemon (JSON lines on stdin/stdout)
   sauron check                      verify config and list cameras
   sauron cameras                    list cameras
   sauron live <camera>              open the live view (camera id or name)
-  sauron snapshot <camera> [out]    save a high-quality snapshot (default ./<name>.jpg)
-  sauron config                     create the config file if missing and print its path
+  sauron snapshot <camera> [out]    save a snapshot (default ./<name>.jpg)
   sauron --version                  print the version
 ";
 
@@ -33,13 +37,13 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
+        ["setup"] => return setup::run().await,
         ["watch"] => daemon::run().await,
         ["check"] => list_cameras(true).await,
         ["cameras"] => list_cameras(false).await,
-        ["live", camera] => live(camera).await,
+        ["live", camera] => live::run(camera).await,
         ["snapshot", camera] => snapshot(camera, None).await,
         ["snapshot", camera, out] => snapshot(camera, Some(out)).await,
-        ["config"] => create_config().await,
         ["--version" | "-V"] => {
             println!("sauron {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -68,7 +72,7 @@ async fn connect() -> Result<(config::Config, Protect)> {
     Ok((config, client))
 }
 
-async fn sorted_cameras(client: &Protect) -> Result<Vec<Camera>> {
+pub async fn sorted_cameras(client: &Protect) -> Result<Vec<Camera>> {
     let mut cameras = client.cameras().await.context("cannot list cameras")?;
     cameras.sort_by_cached_key(|c| c.display_name().to_lowercase());
     Ok(cameras)
@@ -88,7 +92,7 @@ async fn list_cameras(header: bool) -> Result<()> {
 }
 
 /// Finds a camera by id, case-insensitive name, or unique case-insensitive name prefix.
-fn resolve<'a>(cameras: &'a [Camera], query: &str) -> Result<&'a Camera> {
+pub fn resolve<'a>(cameras: &'a [Camera], query: &str) -> Result<&'a Camera> {
     if let Some(camera) = cameras.iter().find(|c| c.id == query) {
         return Ok(camera);
     }
@@ -108,20 +112,7 @@ fn resolve<'a>(cameras: &'a [Camera], query: &str) -> Result<&'a Camera> {
     }
 }
 
-async fn live(query: &str) -> Result<()> {
-    let (config, client) = connect().await?;
-    let cameras = sorted_cameras(&client).await?;
-    let camera = resolve(&cameras, query)?;
-    let url = client
-        .stream_url(&camera.id, &config.live_quality)
-        .await
-        .with_context(|| format!("cannot get {} stream for {}", config.live_quality, camera.display_name()))?;
-    let url = protect::fixup_stream_url(&url, client.hostname())?;
-    // Not awaited: the player lives on in its own process group after we exit.
-    live::spawn_player(&config.player, camera.display_name(), &url)?;
-    Ok(())
-}
-
+/// Saves the best snapshot the camera offers (full HD only where its feature flags allow it).
 async fn snapshot(query: &str, out: Option<&str>) -> Result<()> {
     let (_, client) = connect().await?;
     let cameras = sorted_cameras(&client).await?;
@@ -138,19 +129,10 @@ async fn snapshot(query: &str, out: Option<&str>) -> Result<()> {
         }
     };
     let jpeg = client
-        .snapshot(&camera.id, true)
+        .snapshot(&camera.id, camera.supports_full_hd_snapshot())
         .await
         .with_context(|| format!("cannot fetch snapshot of {}", camera.display_name()))?;
     tokio::fs::write(&path, &jpeg).await.with_context(|| format!("cannot write {}", path.display()))?;
-    println!("{}", path.display());
-    Ok(())
-}
-
-async fn create_config() -> Result<()> {
-    let path = config::config_path();
-    if config::write_template(&path).await? {
-        eprintln!("created config template; add your API key");
-    }
     println!("{}", path.display());
     Ok(())
 }

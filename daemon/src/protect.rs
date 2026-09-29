@@ -22,6 +22,12 @@ use crate::config::Config;
 
 const API_PATH: &str = "/proxy/protect/integration";
 const MAX_CONCURRENT_REQUESTS: usize = 4;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(6);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -57,6 +63,7 @@ pub struct Camera {
 pub struct FeatureFlags {
     pub smart_detect_types: Option<Vec<String>>,
     pub smart_detect_audio_types: Option<Vec<String>>,
+    pub support_full_hd_snapshot: Option<bool>,
 }
 
 impl Camera {
@@ -77,6 +84,11 @@ impl Camera {
         self.state.as_deref() == Some("CONNECTED")
     }
 
+    /// Whether `highQuality=true` snapshots work (Protect answers 400 on cameras without it).
+    pub fn supports_full_hd_snapshot(&self) -> bool {
+        self.feature_flags.as_ref().and_then(|f| f.support_full_hd_snapshot) == Some(true)
+    }
+
     /// Detection kinds this camera can produce.
     pub fn kinds(&self) -> Vec<String> {
         let flags = self.feature_flags.as_ref();
@@ -93,30 +105,21 @@ impl Camera {
     }
 }
 
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Default)]
 #[serde(default)]
-pub struct Streams {
-    pub high: Option<String>,
-    pub medium: Option<String>,
-    pub low: Option<String>,
+struct Streams {
+    high: Option<String>,
+    medium: Option<String>,
+    low: Option<String>,
 }
 
 impl Streams {
-    pub fn get(&self, quality: &str) -> Option<&str> {
+    fn get(&self, quality: &str) -> Option<&str> {
         match quality {
             "high" => self.high.as_deref(),
             "medium" => self.medium.as_deref(),
             "low" => self.low.as_deref(),
             _ => None,
-        }
-    }
-
-    pub fn set(&mut self, quality: &str, url: String) {
-        match quality {
-            "high" => self.high = Some(url),
-            "medium" => self.medium = Some(url),
-            "low" => self.low = Some(url),
-            _ => {}
         }
     }
 }
@@ -189,6 +192,7 @@ pub struct Protect {
 }
 
 impl Protect {
+    /// Client for the configured console; an empty API key sends no key (setup's console probe).
     pub fn new(config: &Config) -> Result<Self> {
         let base = base_url(&config.host)?;
         let hostname = base.host_str().context("config `host` has no hostname")?.to_owned();
@@ -198,8 +202,12 @@ impl Protect {
         http_tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(http_tls)
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .http2_keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
             .build()
             .context("cannot build HTTP client")?;
 
@@ -221,14 +229,52 @@ impl Protect {
         &self.hostname
     }
 
+    /// `host[:port]` of the console: the keyring and session-cache identity.
+    pub fn console_id(&self) -> String {
+        match self.base.port() {
+            Some(port) => format!("{}:{port}", self.hostname),
+            None => self.hostname.clone(),
+        }
+    }
+
+    /// `scheme://host[:port]` of the console, for the UniFi OS (non-integration) endpoints.
+    pub fn origin(&self) -> String {
+        self.base.origin().ascii_serialization()
+    }
+
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    /// TLS settings for websocket connections to the console.
+    pub fn ws_connector(&self) -> Connector {
+        Connector::Rustls(self.ws_tls.clone())
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base.as_str().trim_end_matches('/'))
     }
 
+    /// Status of an unauthenticated `meta/info` request: 401 means a Protect console answered.
+    pub async fn probe(&self) -> Result<StatusCode> {
+        let response =
+            self.http.get(self.url("/v1/meta/info")).send().await.map_err(|e| anyhow!(error_chain(&e)))?;
+        Ok(response.status())
+    }
+
     /// Sends one request under the concurrency cap and reads the whole body.
-    async fn request(&self, method: Method, path: &str, json: Option<&serde_json::Value>) -> Result<Bytes> {
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        json: Option<&serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<Bytes> {
         let _permit = self.permits.acquire().await?;
-        let mut request = self.http.request(method, self.url(path)).header("X-API-KEY", &self.api_key);
+        let mut request = self.http.request(method, self.url(path)).timeout(timeout);
+        if !self.api_key.is_empty() {
+            request = request.header("X-API-KEY", &self.api_key);
+        }
         if let Some(body) = json {
             request = request.json(body);
         }
@@ -245,7 +291,7 @@ impl Protect {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let body = self.request(Method::GET, path, None).await?;
+        let body = self.request(Method::GET, path, None, REQUEST_TIMEOUT).await?;
         serde_json::from_slice(&body).with_context(|| format!("{path}: unexpected response"))
     }
 
@@ -259,18 +305,19 @@ impl Protect {
     }
 
     pub async fn snapshot(&self, camera: &str, high_quality: bool) -> Result<Bytes> {
-        self.request(Method::GET, &format!("/v1/cameras/{camera}/snapshot?highQuality={high_quality}"), None).await
+        let path = format!("/v1/cameras/{camera}/snapshot?highQuality={high_quality}");
+        self.request(Method::GET, &path, None, SNAPSHOT_TIMEOUT).await
     }
 
-    pub async fn streams(&self, camera: &str) -> Result<Streams> {
+    async fn streams(&self, camera: &str) -> Result<Streams> {
         self.get_json(&format!("/v1/cameras/{camera}/rtsps-stream")).await
     }
 
     /// Creates (or returns the existing) stream of `quality`.
-    pub async fn create_stream(&self, camera: &str, quality: &str) -> Result<String> {
+    async fn create_stream(&self, camera: &str, quality: &str) -> Result<String> {
         let path = format!("/v1/cameras/{camera}/rtsps-stream");
         let body = serde_json::json!({ "qualities": [quality] });
-        let body = self.request(Method::POST, &path, Some(&body)).await?;
+        let body = self.request(Method::POST, &path, Some(&body), REQUEST_TIMEOUT).await?;
         let streams: Streams = serde_json::from_slice(&body).with_context(|| format!("{path}: unexpected response"))?;
         streams.get(quality).map(str::to_owned).with_context(|| format!("console returned no {quality} stream"))
     }
@@ -291,7 +338,7 @@ impl Protect {
         let url = format!("{}/v1/subscribe/{topic}", url.as_str().trim_end_matches('/'));
         let mut request = url.as_str().into_client_request()?;
         request.headers_mut().insert("X-API-KEY", self.api_key.parse().context("API key is not a valid header")?);
-        let connector = Connector::Rustls(self.ws_tls.clone());
+        let connector = self.ws_connector();
         match tokio_tungstenite::connect_async_tls_with_config(request, None, true, Some(connector)).await {
             Ok((stream, _)) => Ok(stream),
             Err(tungstenite::Error::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
@@ -339,7 +386,7 @@ fn api_error_message(body: &[u8]) -> String {
 }
 
 /// reqwest's Display omits the cause ("error sending request"); include the chain.
-fn error_chain(err: &dyn std::error::Error) -> String {
+pub fn error_chain(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {

@@ -30,6 +30,9 @@ Item {
   readonly property var muted: settings.muted instanceof Array ? settings.muted : []
   readonly property bool desktop: settings.desktop !== false
   readonly property int snapshotInterval: Math.max(1, Math.min(60, Number(settings.snapshotIntervalSec) || 2))
+  // How many sightings the panel lists; 0 hides the section.
+  readonly property int recentLimit: settings.recentSightings === undefined || settings.recentSightings === null
+    ? 5 : Math.max(0, Math.min(20, Math.round(Number(settings.recentSightings) || 0)))
   // Epoch ms; -1 silences until resumed, anything in the past is inactive.
   readonly property real silencedUntil: Number(settings.silencedUntil) || 0
   property real now: Date.now()
@@ -181,6 +184,19 @@ Item {
     send({ cmd: "reload" })
   }
 
+  // Interactive steps run in Omarchy's floating terminal, like its own setup actions.
+  function runInTerminal(command) {
+    Util.execArgv(["omarchy-launch-floating-terminal-with-presentation", command])
+  }
+
+  function setup() {
+    runInTerminal(Util.shellQuote(binary) + " setup")
+  }
+
+  function install() {
+    runInTerminal(Util.shellQuote(pluginDir + "/install.sh"))
+  }
+
   function updateSettings(patch) {
     if (!shell) return
     var next = {}
@@ -321,7 +337,7 @@ Item {
     lastAlertCamera = ev.camera
     if (!watching && !silenced) unseen++
     var list = [ev].concat(recent)
-    if (list.length > 12) list.length = 12
+    if (list.length > recentLimit) list.length = recentLimit
     recent = list
   }
 
@@ -356,6 +372,7 @@ Item {
   onDesktopChanged: Qt.callLater(pushFilter)
   onSilencedChanged: Qt.callLater(pushFilter)
   onSnapshotIntervalChanged: if (watching) Qt.callLater(pushWatch)
+  onRecentLimitChanged: if (recent.length > recentLimit) recent = recent.slice(0, recentLimit)
 
   // ------------------------------------------------------------ processes
 
@@ -433,6 +450,7 @@ Item {
     function silence(minutes: string): string { root.silence(minutes); return "ok" }
     function resume(): string { root.resume(); return "ok" }
     function restart(): string { root.restart(); return "ok" }
+    function setup(): string { root.setup(); return "ok" }
     function status(): string { return root.status + (root.message !== "" ? ": " + root.message : "") }
   }
 

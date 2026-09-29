@@ -21,7 +21,8 @@
       "notify": ["person", "vehicle", "package", "ring"],
       "muted": [],
       "desktop": true,
-      "snapshotIntervalSec": 2
+      "snapshotIntervalSec": 2,
+      "recentSightings": 5
     },
     "schema": [
       {
@@ -59,6 +60,16 @@
         "max": 60,
         "step": 1,
         "defaultValue": 2
+      },
+      {
+        "key": "recentSightings",
+        "type": "integer",
+        "label": "Recent sightings",
+        "description": "How many past detections the panel lists (0 hides them).",
+        "min": 0,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 5
       }
     ]
   }

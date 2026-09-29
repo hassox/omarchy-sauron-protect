@@ -27,8 +27,6 @@ CARGO_TARGET_DIR="$target" cargo build --release --locked --manifest-path "$src/
 install -Dm755 "$target/release/sauron" "$bin"
 echo "Installed $bin"
 
-config="$("$bin" config)"
-
 if [[ ! -e $plugins/$id ]]; then
   mkdir -p "$plugins"
   ln -s "$src" "$plugins/$id"
@@ -43,7 +41,11 @@ if command -v omarchy-shell >/dev/null; then
   omarchy-shell sauron restart >/dev/null 2>&1 || true
 fi
 
-echo
-echo "Config: $config"
-echo "Add your console host and a Protect API key (Protect > Settings > Control Plane > Integrations),"
-echo "then check the connection with: sauron check"
+config="${SAURON_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sauron/config.toml}"
+if [[ ! -e $config ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    "$bin" setup
+  else
+    echo "Next: run sauron setup"
+  fi
+fi

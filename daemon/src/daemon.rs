@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,16 +17,16 @@ use tokio::time::{Instant, Interval, MissedTickBehavior, interval, sleep, sleep_
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 
 use crate::config::{self, Config};
-use crate::live;
 use crate::notify::{Notification, Notifier};
+use crate::private_api::{self, Warmer};
 use crate::proto::{CameraOut, Command, Level, Msg, Out, PROTOCOL, Phase, State};
-use crate::protect::{self, Camera, DeviceItem, EventItem, Frame, Protect, Streams, WsStream};
+use crate::protect::{self, Camera, DeviceItem, EventItem, Frame, Protect, WsStream};
 
 const CONFIG_POLL: Duration = Duration::from_secs(3);
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 const EVENT_TTL: Duration = Duration::from_secs(30 * 60);
-const PING_EVERY: Duration = Duration::from_secs(60);
-const DEAD_AFTER: Duration = Duration::from_secs(150);
+const PING_EVERY: Duration = Duration::from_secs(20);
+const DEAD_AFTER: Duration = Duration::from_secs(45);
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const AUTH_BACKOFF: Duration = Duration::from_secs(60);
@@ -41,15 +42,12 @@ enum Internal {
     StdinClosed,
     Status { generation: u64, state: State, message: Option<String>, protect: Option<String> },
     Cameras { generation: u64, cameras: Vec<Camera> },
-    Streams { generation: u64, camera: String, streams: Streams },
     Event { generation: u64, action: String, item: EventItem },
     CameraPatch { generation: u64, item: DeviceItem },
     Disconnected { generation: u64 },
     Snapshot { camera: String, tracked: bool, result: Result<u64, String> },
-    PlayerSpawned { generation: u64, camera: String, pid: u32, created: Option<String> },
-    PlayerFailed { camera: String, message: String },
-    PlayerExited { camera: String, pid: u32 },
-    Focused { camera: String, result: Result<(), String> },
+    /// The system resumed from suspend: every connection is suspect.
+    Resumed,
     Log(Level, String),
 }
 
@@ -106,36 +104,43 @@ impl Filter {
     }
 }
 
-enum Player {
-    Starting,
-    Running(u32),
-}
-
-struct Session {
+/// One connection attempt per config load; replaced on reload and resume.
+struct Connection {
     config: Config,
     client: Arc<Protect>,
+    /// Keeps a private-API session warm for instant live; `None` when instant live is not set up.
+    warmer: Option<Arc<Warmer>>,
     task: JoinHandle<()>,
+}
+
+/// Why the connection is being (re)built.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reload {
+    Startup,
+    /// Config changed or `reload` command: also forget the private-API session.
+    Config,
+    /// Resumed from suspend: same config, fresh connections.
+    Resume,
 }
 
 struct Daemon {
     out: Out,
     tx: Tx,
+    exe: PathBuf,
     shared: Arc<Shared>,
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
     generation: u64,
-    session: Option<Session>,
+    connection: Option<Connection>,
     status: (State, Option<String>, Option<String>),
     cameras: HashMap<String, Cam>,
     emitted_cameras: Option<Vec<CamView>>,
-    streams: HashMap<String, Streams>,
     events: HashMap<String, OpenEvent>,
     ended: VecDeque<String>,
     filter: Filter,
     watch: Option<Interval>,
     in_flight: HashSet<String>,
     snapshot_errors: HashMap<String, String>,
-    players: HashMap<String, Player>,
 }
 
 enum Wake {
@@ -158,7 +163,7 @@ pub async fn run() -> Result<()> {
 
     let mut daemon = Daemon {
         out: Out::new(),
-        tx,
+        tx: tx.clone(),
         shared: Arc::new(Shared {
             snap_dir,
             events_dir,
@@ -166,14 +171,14 @@ pub async fn run() -> Result<()> {
             write_lock: Mutex::new(()),
             notifier: Notifier::new(exe.to_string_lossy().into_owned()),
         }),
+        exe,
         config_path: config::config_path(),
         config_mtime: None,
         generation: 0,
-        session: None,
+        connection: None,
         status: (State::Connecting, None, None),
         cameras: HashMap::new(),
         emitted_cameras: None,
-        streams: HashMap::new(),
         events: HashMap::new(),
         ended: VecDeque::with_capacity(ENDED_REMEMBERED),
         filter: Filter {
@@ -184,11 +189,11 @@ pub async fn run() -> Result<()> {
         watch: None,
         in_flight: HashSet::new(),
         snapshot_errors: HashMap::new(),
-        players: HashMap::new(),
     };
 
     emit(&mut daemon.out, &Msg::Hello { version: env!("CARGO_PKG_VERSION"), protocol: PROTOCOL }).await;
-    daemon.reload().await;
+    daemon.reload(Reload::Startup).await;
+    tokio::spawn(watch_resume(tx));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -213,7 +218,7 @@ pub async fn run() -> Result<()> {
             Wake::WatchTick => daemon.watch_tick(),
             Wake::ConfigPoll => {
                 if config_mtime(&daemon.config_path).await != daemon.config_mtime {
-                    daemon.reload().await;
+                    daemon.reload(Reload::Config).await;
                 }
             }
             Wake::Sweep => daemon.sweep().await,
@@ -306,29 +311,43 @@ impl Daemon {
         self.status.0 == State::Online
     }
 
-    /// Re-reads the config and restarts the connection session.
-    async fn reload(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.task.abort();
+    /// Restarts the connection: re-reading the config, or with the same config after a resume.
+    async fn reload(&mut self, why: Reload) {
+        if why == Reload::Resume && self.connection.is_none() {
+            return;
+        }
+        let previous = self.connection.take();
+        if let Some(connection) = &previous {
+            connection.task.abort();
         }
         self.generation += 1;
         self.force_end_all().await;
-        self.config_mtime = config_mtime(&self.config_path).await;
+        if why == Reload::Config {
+            private_api::forget_session().await;
+        }
 
-        let started = match config::load(&self.config_path).await {
-            Ok(config) => Protect::new(&config).map(|client| (config, Arc::new(client))),
-            Err(err) => Err(err),
+        let config = match previous {
+            Some(connection) if why == Reload::Resume => Ok(connection.config),
+            _ => {
+                self.config_mtime = config_mtime(&self.config_path).await;
+                config::load(&self.config_path).await.map_err(|err| err.to_string())
+            }
         };
+        let started = config.and_then(|config| match Protect::new(&config) {
+            Ok(client) => Ok((config, Arc::new(client))),
+            Err(err) => Err(format!("Config error: {err:#}")),
+        });
         match started {
             Ok((config, client)) => {
                 self.set_status(State::Connecting, None, None).await;
+                let warmer = (!config.username.is_empty())
+                    .then(|| Arc::new(Warmer::new(client.clone(), config.username.clone())));
                 let task = tokio::spawn(run_session(self.generation, client.clone(), self.tx.clone()));
-                self.session = Some(Session { config, client, task });
+                self.connection = Some(Connection { config, client, warmer, task });
             }
-            Err(err) => {
-                self.set_status(State::Unconfigured, Some(format!("{err:#}")), None).await;
+            Err(message) => {
+                self.set_status(State::Unconfigured, Some(message), None).await;
                 self.cameras.clear();
-                self.streams.clear();
                 self.emit_cameras().await;
             }
         }
@@ -345,9 +364,7 @@ impl Daemon {
             Internal::Cameras { generation, cameras } if generation == self.generation => {
                 self.set_cameras(cameras).await;
             }
-            Internal::Streams { generation, camera, streams } if generation == self.generation => {
-                self.streams.insert(camera, streams);
-            }
+            Internal::Resumed => self.reload(Reload::Resume).await,
             Internal::Event { generation, action, item } if generation == self.generation => {
                 self.on_event(&action, item).await;
             }
@@ -356,33 +373,10 @@ impl Daemon {
             }
             Internal::Disconnected { generation } if generation == self.generation => self.force_end_all().await,
             Internal::Snapshot { camera, tracked, result } => self.on_snapshot(camera, tracked, result).await,
-            Internal::PlayerSpawned { generation, camera, pid, created } => {
-                if let (Some(url), true) = (created, generation == self.generation) {
-                    let quality = self.session.as_ref().map(|s| s.config.live_quality.as_str()).unwrap_or("high");
-                    self.streams.entry(camera.clone()).or_default().set(quality, url);
-                }
-                self.players.insert(camera.clone(), Player::Running(pid));
-                self.live_result(&camera, true, None).await;
-            }
-            Internal::PlayerFailed { camera, message } => {
-                if matches!(self.players.get(&camera), Some(Player::Starting)) {
-                    self.players.remove(&camera);
-                }
-                self.live_result(&camera, false, Some(&message)).await;
-            }
-            Internal::PlayerExited { camera, pid } => {
-                if matches!(self.players.get(&camera), Some(Player::Running(p)) if *p == pid) {
-                    self.players.remove(&camera);
-                }
-            }
-            Internal::Focused { camera, result } => {
-                self.live_result(&camera, result.is_ok(), result.err().as_deref()).await;
-            }
             Internal::Log(level, message) => self.log(level, &message).await,
             // Stale data from a superseded session.
             Internal::Status { .. }
             | Internal::Cameras { .. }
-            | Internal::Streams { .. }
             | Internal::Event { .. }
             | Internal::CameraPatch { .. }
             | Internal::Disconnected { .. } => {}
@@ -427,7 +421,7 @@ impl Daemon {
                 }
             }
             Command::Live { camera } => self.live(camera).await,
-            Command::Reload => self.reload().await,
+            Command::Reload => self.reload(Reload::Config).await,
         }
     }
 
@@ -441,7 +435,6 @@ impl Daemon {
             let kinds = info.kinds();
             self.cameras.insert(info.id.clone(), Cam { info, kinds, seq, snapshot });
         }
-        self.streams.retain(|id, _| self.cameras.contains_key(id));
         self.emit_cameras().await;
     }
 
@@ -508,11 +501,12 @@ impl Daemon {
 
     /// Starts a tracked low-quality refresh unless one is already in flight for the camera.
     fn fetch_snapshot(&mut self, camera: &str) {
-        let Some(session) = &self.session else { return };
+        let Some(connection) = &self.connection else { return };
         if !self.in_flight.insert(camera.to_owned()) {
             return;
         }
-        let (shared, client, tx, camera) = (self.shared.clone(), session.client.clone(), self.tx.clone(), camera.to_owned());
+        let (shared, client, tx, camera) =
+            (self.shared.clone(), connection.client.clone(), self.tx.clone(), camera.to_owned());
         tokio::spawn(async move {
             let result = store_snapshot(&shared, &client, &camera, None, &tx, true).await;
             if let Err(err) = result {
@@ -633,10 +627,10 @@ impl Daemon {
         }
     }
 
-    /// Snapshot to `snap/` + `events/`, then the desktop notification; runs detached so the
-    /// `event` line is never delayed.
+    /// Desktop notification first, then the snapshot and the notification again with the image;
+    /// runs detached so the `event` line is never delayed.
     fn event_actions(&self, id: &str) {
-        let (Some(session), Some(open)) = (&self.session, self.events.get(id)) else { return };
+        let (Some(connection), Some(open)) = (&self.connection, self.events.get(id)) else { return };
         let camera_name = self.cameras.get(&open.camera).map_or(open.camera.as_str(), |c| c.info.display_name());
         let job = EventJob {
             event_id: id.to_owned(),
@@ -646,7 +640,9 @@ impl Daemon {
             start: open.start,
             desktop: self.filter.desktop,
         };
-        tokio::spawn(run_event_job(self.shared.clone(), session.client.clone(), self.tx.clone(), job));
+        let (shared, client, warmer, tx) =
+            (self.shared.clone(), connection.client.clone(), connection.warmer.clone(), self.tx.clone());
+        tokio::spawn(run_event_job(shared, client, warmer, tx, job));
     }
 
     // ---- live ----------------------------------------------------------------------------
@@ -655,34 +651,47 @@ impl Daemon {
         emit(&mut self.out, &Msg::Live { camera, ok, message }).await;
     }
 
+    /// Runs `sauron live <camera>` detached: it focuses an open viewer or starts one.
     async fn live(&mut self, camera: String) {
-        let (Some(session), Some(cam)) = (&self.session, self.cameras.get(&camera)) else {
-            let message = if self.session.is_none() { "not configured" } else { "unknown camera" };
-            return self.live_result(&camera, false, Some(message)).await;
-        };
-        match self.players.get(&camera) {
-            Some(Player::Running(pid)) => {
-                let (pid, tx) = (*pid, self.tx.clone());
+        if self.connection.is_none() {
+            return self.live_result(&camera, false, Some("Not set up yet: run sauron setup")).await;
+        }
+        if !self.cameras.contains_key(&camera) {
+            return self.live_result(&camera, false, Some("unknown camera")).await;
+        }
+        let spawned = tokio::process::Command::new(&self.exe)
+            .arg("live")
+            .arg(&camera)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+        match spawned {
+            Ok(mut viewer) => {
+                let (tx, name) = (self.tx.clone(), self.camera_name(&camera).to_owned());
                 tokio::spawn(async move {
-                    let result = live::focus(pid).await.map_err(|e| format!("{e:#}"));
-                    let _ = tx.send(Internal::Focused { camera, result });
+                    match viewer.wait().await {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            let _ = tx.send(Internal::Log(Level::Warn, format!("live view of {name}: {status}")));
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Internal::Log(Level::Warn, format!("live view of {name}: {err}")));
+                        }
+                    }
                 });
+                self.live_result(&camera, true, None).await;
             }
-            Some(Player::Starting) => self.live_result(&camera, true, Some("player is starting")).await,
-            None => {
-                let quality = session.config.live_quality.clone();
-                let job = LiveJob {
-                    generation: self.generation,
-                    cached: self.streams.get(&camera).and_then(|s| s.get(&quality)).map(str::to_owned),
-                    quality,
-                    player: session.config.player.clone(),
-                    camera_name: cam.info.display_name().to_owned(),
-                    camera: camera.clone(),
-                };
-                tokio::spawn(run_live_job(session.client.clone(), self.tx.clone(), job));
-                self.players.insert(camera, Player::Starting);
+            Err(err) => {
+                let message = format!("cannot start `sauron live`: {err}");
+                self.live_result(&camera, false, Some(&message)).await;
             }
         }
+    }
+
+    fn camera_name<'a>(&'a self, camera: &'a str) -> &'a str {
+        self.cameras.get(camera).map_or(camera, |cam| cam.info.display_name())
     }
 }
 
@@ -697,8 +706,34 @@ struct EventJob {
     desktop: bool,
 }
 
-async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, tx: Tx, job: EventJob) {
-    let image = match store_snapshot(&shared, &client, &job.camera, Some(&job.event_id), &tx, false).await {
+async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, warmer: Option<Arc<Warmer>>, tx: Tx, job: EventJob) {
+    let notify = |image: Option<PathBuf>| {
+        let (shared, tx, job) = (&shared, &tx, &job);
+        async move {
+            let notification = Notification {
+                event_id: &job.event_id,
+                camera_id: &job.camera,
+                camera_name: &job.camera_name,
+                kinds: &job.kinds,
+                start_ms: job.start,
+                image: image.as_deref(),
+            };
+            if let Err(err) = shared.notifier.notify(&notification).await {
+                let _ = tx.send(Internal::Log(Level::Warn, format!("notification: {err:#}")));
+            }
+        }
+    };
+    let first = async {
+        if job.desktop {
+            // An update (kinds grew) keeps the image the earlier notification already shows.
+            let previous = shared.events_dir.join(format!("{}.jpg", job.event_id));
+            let image = tokio::fs::try_exists(&previous).await.unwrap_or(false).then_some(previous);
+            notify(image).await;
+        }
+    };
+    let snapshot = store_snapshot(&shared, &client, &job.camera, Some(&job.event_id), &tx, false);
+    let ((), image) = tokio::join!(first, snapshot);
+    let image = match image {
         Ok(path) => {
             if let Err(err) = prune_event_images(&shared.events_dir).await {
                 let _ = tx.send(Internal::Log(Level::Error, format!("pruning event images: {err:#}")));
@@ -714,16 +749,14 @@ async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, tx: Tx, job: E
     if !job.desktop {
         return;
     }
-    let notification = Notification {
-        event_id: &job.event_id,
-        camera_id: &job.camera,
-        camera_name: &job.camera_name,
-        kinds: &job.kinds,
-        start_ms: job.start,
-        image: image.as_deref(),
-    };
-    if let Err(err) = shared.notifier.notify(&notification).await {
-        let _ = tx.send(Internal::Log(Level::Warn, format!("notification: {err:#}")));
+    if image.is_some() {
+        notify(image).await;
+    }
+    // A click on the notification opens live video: have a private-API session ready for it.
+    if let Some(warmer) = warmer
+        && let Err(err) = warmer.warm().await
+    {
+        let _ = tx.send(Internal::Log(Level::Warn, format!("instant live: {err:#}")));
     }
 }
 
@@ -790,42 +823,6 @@ async fn prune_event_images(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-struct LiveJob {
-    generation: u64,
-    camera: String,
-    camera_name: String,
-    quality: String,
-    cached: Option<String>,
-    player: Vec<String>,
-}
-
-async fn run_live_job(client: Arc<Protect>, tx: Tx, job: LiveJob) {
-    let spawned = async {
-        let (url, created) = match job.cached {
-            Some(url) => (url, None),
-            None => {
-                let url = client.create_stream(&job.camera, &job.quality).await?;
-                (url.clone(), Some(url))
-            }
-        };
-        let url = protect::fixup_stream_url(&url, client.hostname())?;
-        let child = live::spawn_player(&job.player, &job.camera_name, &url)?;
-        let pid = child.id().ok_or_else(|| anyhow!("player exited immediately"))?;
-        anyhow::Ok((child, pid, created))
-    };
-    match spawned.await {
-        Ok((mut child, pid, created)) => {
-            let camera = job.camera;
-            let _ = tx.send(Internal::PlayerSpawned { generation: job.generation, camera: camera.clone(), pid, created });
-            let _ = child.wait().await;
-            let _ = tx.send(Internal::PlayerExited { camera, pid });
-        }
-        Err(err) => {
-            let _ = tx.send(Internal::PlayerFailed { camera: job.camera, message: format!("{err:#}") });
-        }
-    }
-}
-
 // ---- connection session ----------------------------------------------------------------------
 
 /// Connects, streams both websockets and reconnects with backoff until aborted.
@@ -860,7 +857,6 @@ async fn session_once(
     let (mut events, mut devices) = tokio::try_join!(client.subscribe("events"), client.subscribe("devices"))?;
 
     let mut background = JoinSet::new();
-    background.spawn(fetch_streams(generation, client.clone(), tx.clone(), camera_ids(&cameras)));
     let _ = tx.send(Internal::Cameras { generation, cameras });
     let _ = tx.send(Internal::Status { generation, state: State::Online, message: None, protect: Some(version) });
     *backoff = BACKOFF_MIN;
@@ -922,16 +918,10 @@ async fn ping_socket(topic: &str, socket: &mut WsStream) -> Result<()> {
     socket.send(Message::Ping(Bytes::new())).await.map_err(|err| anyhow!("{topic} websocket: {err}"))
 }
 
-fn camera_ids(cameras: &[Camera]) -> Vec<String> {
-    cameras.iter().map(|c| c.id.clone()).collect()
-}
-
 async fn refetch_cameras(generation: u64, client: Arc<Protect>, tx: Tx) {
     match client.cameras().await {
         Ok(cameras) => {
-            let ids = camera_ids(&cameras);
             let _ = tx.send(Internal::Cameras { generation, cameras });
-            fetch_streams(generation, client, tx, ids).await;
         }
         Err(err) => {
             let _ = tx.send(Internal::Log(Level::Warn, format!("refreshing cameras: {err:#}")));
@@ -939,20 +929,29 @@ async fn refetch_cameras(generation: u64, client: Arc<Protect>, tx: Tx) {
     }
 }
 
-/// Caches every camera's stream URLs (concurrency capped by the client).
-async fn fetch_streams(generation: u64, client: Arc<Protect>, tx: Tx, cameras: Vec<String>) {
-    let fetches = cameras.into_iter().map(|camera| {
-        let (client, tx) = (&client, &tx);
-        async move {
-            match client.streams(&camera).await {
-                Ok(streams) => {
-                    let _ = tx.send(Internal::Streams { generation, camera, streams });
-                }
-                Err(err) => {
-                    let _ = tx.send(Internal::Log(Level::Warn, format!("stream URLs for {camera}: {err:#}")));
-                }
-            }
+/// Reports `Resumed` after each suspend: logind's `PrepareForSleep(false)` on the system bus.
+async fn watch_resume(tx: Tx) {
+    if let Err(err) = watch_resume_inner(&tx).await {
+        let _ = tx.send(Internal::Log(Level::Warn, format!("cannot watch for resume from suspend: {err:#}")));
+    }
+}
+
+async fn watch_resume_inner(tx: &Tx) -> Result<()> {
+    let bus = zbus::Connection::system().await.context("system bus")?;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.login1")?
+        .path("/org/freedesktop/login1")?
+        .interface("org.freedesktop.login1.Manager")?
+        .member("PrepareForSleep")?
+        .build();
+    let mut signals = zbus::MessageStream::for_match_rule(rule, &bus, None).await?;
+    while let Some(message) = signals.next().await {
+        if let Ok(false) = message?.body().deserialize::<bool>()
+            && tx.send(Internal::Resumed).is_err()
+        {
+            return Ok(());
         }
-    });
-    futures_util::future::join_all(fetches).await;
+    }
+    bail!("system bus connection closed")
 }

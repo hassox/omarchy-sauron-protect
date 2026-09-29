@@ -1,10 +1,14 @@
-//! Mock UniFi Protect Integration API for end-to-end testing without cameras.
+//! Mock UniFi Protect console for end-to-end testing without cameras: the Integration API, the
+//! UniFi OS login and Protect's private livestream.
 //!
 //! `cargo run --example mock_protect -- [--port 7447] [--interval 20]`, then point sauron at
-//! `host = "http://127.0.0.1:7447"` with `api_key = "mock"`.
-//! `curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'` fires an event.
+//! `host = "http://127.0.0.1:7447"` with `api_key = "mock"`; the UniFi OS user is `sauron` with
+//! password `mock` (user `mfa`, same password, behaves like an account with MFA enabled).
+//! `curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'` fires an event;
+//! `POST /mock/livestream?fail=true|false` breaks or repairs the livestream endpoint;
+//! `POST /mock/expire-sessions` logs every UniFi OS session out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -16,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, interval_at, sleep};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Callback, ErrorResponse, Request, Response};
@@ -27,6 +31,17 @@ const API: &str = "/proxy/protect/integration";
 const UNAUTHENTICATED: &str =
     r#"{"error":"Failed to authenticate request using 'apiKey'","name":"UNAUTHENTICATED","type":"apiKey"}"#;
 const MAX_HEAD: usize = 16 * 1024;
+const LOGIN_USER: &str = "sauron";
+const MFA_USER: &str = "mfa";
+const LOGIN_PASSWORD: &str = "mock";
+/// Failed logins allowed per minute before the console answers 429.
+const LOGIN_FAILURES_ALLOWED: usize = 5;
+const LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LIVESTREAM_PATH: &str = "/proxy/protect/api/ws/livestream";
+/// Where the minted websocket URL points; the host is deliberately unreachable so clients must
+/// rewrite it to the console address, as on multi-homed consoles.
+const LIVESTREAM_WS_PATH: &str = "/ws/livestream";
+const LIVESTREAM_INTERNAL_HOST: &str = "unifi.internal";
 
 struct CameraDef {
     id: &'static str,
@@ -62,12 +77,20 @@ const CAMERAS: [CameraDef; 5] = [
     CameraDef { id: "66d025b301ebc903e8000005", name: "Side Gate", model: "G5 Flex", types: &[], hue: 288 },
 ];
 const FRONT_DOOR: usize = 0;
+/// Answers 400 to `highQuality=true` snapshots, like the G5 Pro (supportFullHdSnapshot false).
+const DRIVEWAY: usize = 1;
 const SIDE_GATE: usize = 4;
 
 struct State {
     connected: [bool; CAMERAS.len()],
     streams: HashSet<(usize, String)>,
     rng: u64,
+    /// UniFi OS session cookies (the `TOKEN` value) that are logged in.
+    sessions: HashSet<String>,
+    login_failures: VecDeque<Instant>,
+    /// Single-use livestream websocket tokens.
+    livestream_tokens: HashMap<String, LivestreamTarget>,
+    livestream_broken: bool,
 }
 
 struct Mock {
@@ -75,6 +98,8 @@ struct Mock {
     events: broadcast::Sender<String>,
     devices: broadcast::Sender<String>,
     drawtext: bool,
+    port: u16,
+    livestreams: Mutex<HashMap<(usize, u8), Arc<Livestream>>>,
 }
 
 impl Mock {
@@ -101,6 +126,28 @@ impl Mock {
         format!("{:016x}{:08x}", self.random(), self.random() as u32)
     }
 
+    fn new_uuid(&self) -> String {
+        let (a, b) = (self.random(), self.random());
+        format!("{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}", a >> 32, a & 0xffff, b >> 52, (b >> 40) & 0xfff, b & 0xffff_ffff_ffff)
+    }
+
+    /// The encoder for a camera channel, started on first use and kept running for later viewers.
+    fn livestream(self: &Arc<Self>, camera: usize, channel: u8) -> Arc<Livestream> {
+        let mut livestreams = self.livestreams.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        livestreams
+            .entry((camera, channel))
+            .or_insert_with(|| {
+                let stream = Arc::new(Livestream {
+                    cache: Mutex::new(Gop { init: Vec::new(), fragments: Vec::new() }),
+                    live: broadcast::channel(256).0,
+                    phase: watch::channel(Phase::Starting).0,
+                });
+                tokio::spawn(encode(self.clone(), camera, channel, stream.clone()));
+                stream
+            })
+            .clone()
+    }
+
     fn connected(&self, camera: usize) -> bool {
         self.state().connected[camera]
     }
@@ -121,7 +168,7 @@ impl Mock {
             "mac": format!("24A43C3DFE0{index}"),
             "isMicEnabled": true,
             "featureFlags": {
-                "supportFullHdSnapshot": true,
+                "supportFullHdSnapshot": index != DRIVEWAY,
                 "hasHdr": true,
                 "smartDetectTypes": camera.types,
                 "smartDetectAudioTypes": [],
@@ -161,10 +208,16 @@ async fn main() -> io::Result<()> {
             connected: [true, true, true, true, false],
             streams: HashSet::new(),
             rng: now_ms() | 1,
+            sessions: HashSet::new(),
+            login_failures: VecDeque::new(),
+            livestream_tokens: HashMap::new(),
+            livestream_broken: false,
         }),
         events: broadcast::channel(64).0,
         devices: broadcast::channel(64).0,
         drawtext: has_drawtext().await,
+        port,
+        livestreams: Mutex::new(HashMap::new()),
     });
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!(
@@ -245,11 +298,21 @@ async fn serve(mock: &Arc<Mock>, mut stream: TcpStream) -> io::Result<()> {
     let (head, mut buf, head_len) = read_head(&mut stream).await?;
     let url = reqwest::Url::parse(&format!("http://mock{}", head.target)).map_err(io::Error::other)?;
     let is_upgrade = head.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    if is_upgrade && url.path() == LIVESTREAM_WS_PATH {
+        // The URL's token is the only credential, and it works once.
+        let token = url.query_pairs().find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let Some(target) = mock.state().livestream_tokens.remove(&token) else {
+            eprintln!("mock: livestream websocket rejected: unknown token");
+            return respond(&mut stream, &json_reply(401, &json!({"error": "invalid token"}))).await;
+        };
+        let replay = Rewind { prefix: buf, pos: 0, inner: stream };
+        return livestream_socket(mock.clone(), replay, target).await;
+    }
     if is_upgrade {
         let topic = match url.path().strip_prefix(API) {
             Some("/v1/subscribe/events") => &mock.events,
             Some("/v1/subscribe/devices") => &mock.devices,
-            _ => return respond(&mut stream, 404, "application/json", br#"{"error":"Not found","name":"NOT_FOUND"}"#).await,
+            _ => return respond(&mut stream, &not_found()).await,
         };
         let replay = Rewind { prefix: buf, pos: 0, inner: stream };
         return websocket(replay, topic.subscribe(), url.path().to_owned()).await;
@@ -262,33 +325,57 @@ async fn serve(mock: &Arc<Mock>, mut stream: TcpStream) -> io::Result<()> {
         }
     }
     let body = &buf[head_len..head_len + length];
-    let (status, content_type, response) = route(mock, &head, &url, body).await;
-    eprintln!("mock: {} {} -> {status}", head.method, head.target);
-    respond(&mut stream, status, content_type, &response).await
+    let reply = route(mock, &head, &url, body).await;
+    eprintln!("mock: {} {} -> {}", head.method, head.target, reply.status);
+    respond(&mut stream, &reply).await
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> io::Result<()> {
-    let reason = match status {
+async fn respond(stream: &mut TcpStream, reply: &Reply) -> io::Result<()> {
+    let reason = match reply.status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        429 => "Too Many Requests",
+        499 => "Client Closed Request",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+    let mut head = format!(
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        reply.status,
+        reply.content_type,
+        reply.body.len()
     );
+    for (name, value) in &reply.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await?;
+    stream.write_all(&reply.body).await?;
     stream.shutdown().await
 }
 
-type Reply = (u16, &'static str, Vec<u8>);
+struct Reply {
+    status: u16,
+    content_type: &'static str,
+    body: Vec<u8>,
+    headers: Vec<(&'static str, String)>,
+}
+
+impl Reply {
+    fn new(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self { status, content_type, body, headers: Vec::new() }
+    }
+
+    fn header(mut self, name: &'static str, value: String) -> Self {
+        self.headers.push((name, value));
+        self
+    }
+}
 
 fn json_reply(status: u16, value: &Value) -> Reply {
-    (status, "application/json", value.to_string().into_bytes())
+    Reply::new(status, "application/json", value.to_string().into_bytes())
 }
 
 fn not_found() -> Reply {
@@ -297,12 +384,31 @@ fn not_found() -> Reply {
 
 async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -> Reply {
     let query = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
-    if head.method == "POST" && url.path() == "/mock/trigger" {
-        return trigger(mock, query("camera").as_deref(), query("kind").as_deref().unwrap_or("person"));
+    match (head.method.as_str(), url.path()) {
+        ("POST", "/mock/trigger") => {
+            return trigger(mock, query("camera").as_deref(), query("kind").as_deref().unwrap_or("person"));
+        }
+        ("POST", "/mock/livestream") => {
+            let broken = query("fail").as_deref() == Some("true");
+            mock.state().livestream_broken = broken;
+            return json_reply(200, &json!({"ok": true, "livestreamBroken": broken}));
+        }
+        ("POST", "/mock/expire-sessions") => {
+            mock.state().sessions.clear();
+            return json_reply(200, &json!({"ok": true}));
+        }
+        // UniFi OS hands out a CSRF token with its root page.
+        ("GET", "/") => {
+            return Reply::new(200, "text/html", b"<!doctype html><title>UniFi OS</title>".to_vec())
+                .header("X-CSRF-Token", mock.new_uuid());
+        }
+        ("POST", "/api/auth/login") => return login(mock, body),
+        ("GET", LIVESTREAM_PATH) => return livestream_endpoint(mock, head, &query),
+        _ => {}
     }
     let Some(path) = url.path().strip_prefix(API) else { return not_found() };
     if !head.authorized() {
-        return (401, "application/json", UNAUTHENTICATED.as_bytes().to_vec());
+        return Reply::new(401, "application/json", UNAUTHENTICATED.as_bytes().to_vec());
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (head.method.as_str(), segments.as_slice()) {
@@ -319,8 +425,12 @@ async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -
             if !mock.connected(index) {
                 return json_reply(503, &json!({"error": "The camera is offline or not reachable.", "name": "OFFLINE"}));
             }
-            match render_snapshot(mock, index, query("highQuality").as_deref() == Some("true")).await {
-                Ok(jpeg) => (200, "image/jpeg", jpeg),
+            let high_quality = query("highQuality").as_deref() == Some("true");
+            if high_quality && index == DRIVEWAY {
+                return json_reply(400, &json!({"error": "Full HD snapshots are not supported", "name": "BAD_REQUEST"}));
+            }
+            match render_snapshot(mock, index, high_quality).await {
+                Ok(jpeg) => Reply::new(200, "image/jpeg", jpeg),
                 Err(err) => json_reply(500, &json!({"error": err.to_string(), "name": "API_ERROR"})),
             }
         }
@@ -456,6 +566,337 @@ async fn websocket(stream: Rewind, mut frames: broadcast::Receiver<String>, path
         }
     }
     eprintln!("mock: websocket {path} closed");
+    Ok(())
+}
+
+// ---- UniFi OS login and the private livestream ------------------------------------------------
+
+/// `POST /api/auth/login`: session cookie + CSRF header on success; 401 for bad credentials, 499
+/// `MFA_AUTH_REQUIRED` for an MFA account, 429 after too many failures (UniFi OS behaviour as
+/// seen by hjdhjd/unifi-protect, uiprotect, aiounifi and unifi-cli).
+fn login(mock: &Mock, body: &[u8]) -> Reply {
+    let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let username = request["username"].as_str().unwrap_or_default();
+    let password = request["password"].as_str().unwrap_or_default();
+    let (token, csrf, user_id) = (format!("mock.{}.{}", mock.new_id(), mock.new_id()), mock.new_uuid(), mock.new_uuid());
+
+    let mut state = mock.state();
+    let now = Instant::now();
+    while state.login_failures.front().is_some_and(|at| now.duration_since(*at) > LOGIN_WINDOW) {
+        state.login_failures.pop_front();
+    }
+    if state.login_failures.len() >= LOGIN_FAILURES_ALLOWED {
+        return json_reply(
+            429,
+            &json!({"code": "AUTHENTICATION_FAILED_LIMIT_REACHED", "message": "You've reached the login attempt limit"}),
+        );
+    }
+    if password != LOGIN_PASSWORD || !matches!(username, LOGIN_USER | MFA_USER) {
+        state.login_failures.push_back(now);
+        return json_reply(
+            401,
+            &json!({"code": "AUTHENTICATION_FAILED_INVALID_CREDENTIALS", "message": "Invalid username or password"}),
+        );
+    }
+    if username == MFA_USER {
+        return json_reply(
+            499,
+            &json!({
+                "code": "MFA_AUTH_REQUIRED",
+                "message": "MFA Authentication Required",
+                "data": {"mfaCookie": format!("UBIC_2FA={user_id}"), "authenticators": [{"id": user_id, "type": "totp"}]},
+            }),
+        );
+    }
+    state.sessions.insert(token.clone());
+    json_reply(200, &json!({"unique_id": user_id, "username": username, "isOwner": false, "deviceToken": ""}))
+        .header("Set-Cookie", format!("TOKEN={token}; path=/; samesite=strict; secure; httponly"))
+        .header("X-Updated-CSRF-Token", csrf)
+}
+
+struct LivestreamTarget {
+    camera: usize,
+    channel: u8,
+    chunk_size: usize,
+}
+
+/// `GET /proxy/protect/api/ws/livestream?camera=…&channel=…&type=fmp4…` → `{"url": "ws://…"}`, a
+/// single-use URL on an internal hostname (clients rewrite the host and keep port and token).
+fn livestream_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<String>) -> Reply {
+    let cookie = head
+        .header("cookie")
+        .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|pair| pair.strip_prefix("TOKEN=")));
+    let token = mock.new_id();
+    let mut state = mock.state();
+    if !cookie.is_some_and(|cookie| state.sessions.contains(cookie)) {
+        return json_reply(401, &json!({"error": "Unauthorized"}));
+    }
+    if state.livestream_broken {
+        return json_reply(500, &json!({"error": "Livestream unavailable (mock failure)"}));
+    }
+    let Some(camera) = query("camera").and_then(|id| CAMERAS.iter().position(|c| c.id == id)) else {
+        return json_reply(400, &json!({"error": "Invalid camera"}));
+    };
+    if !state.connected[camera] {
+        return json_reply(503, &json!({"error": "Camera is not connected"}));
+    }
+    let Some(channel) = query("channel").and_then(|c| c.parse::<u8>().ok()).filter(|c| *c <= 2) else {
+        return json_reply(400, &json!({"error": "Invalid channel"}));
+    };
+    if query("type").as_deref() != Some("fmp4") {
+        return json_reply(400, &json!({"error": "Only fmp4 is supported by the mock"}));
+    }
+    let chunk_size = query("chunkSize").and_then(|c| c.parse().ok()).filter(|c| (256..=1 << 20).contains(c));
+    let target = LivestreamTarget { camera, channel, chunk_size: chunk_size.unwrap_or(4096) };
+    state.livestream_tokens.insert(token.clone(), target);
+    let url = format!("ws://{LIVESTREAM_INTERNAL_HOST}:{}{LIVESTREAM_WS_PATH}?token={token}", mock.port);
+    json_reply(200, &json!({ "url": url }))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Starting,
+    Ready,
+    Ended,
+}
+
+struct Fragment {
+    moof: Vec<u8>,
+    mdat: Vec<u8>,
+}
+
+/// The init segment and every fragment since the last keyframe: what a new viewer gets at once.
+struct Gop {
+    init: Vec<u8>,
+    fragments: Vec<Arc<Fragment>>,
+}
+
+/// One continuously encoding camera channel. `live` carries new fragments (`None` = encoder died).
+struct Livestream {
+    cache: Mutex<Gop>,
+    live: broadcast::Sender<Option<Arc<Fragment>>>,
+    phase: watch::Sender<Phase>,
+}
+
+impl Livestream {
+    fn cache(&self) -> std::sync::MutexGuard<'_, Gop> {
+        self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+async fn encode(mock: Arc<Mock>, camera: usize, channel: u8, stream: Arc<Livestream>) {
+    if let Err(err) = encode_fmp4(&mock, camera, channel, &stream).await {
+        eprintln!("mock: livestream {} channel {channel}: {err}", CAMERAS[camera].name);
+    }
+    mock.livestreams.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&(camera, channel));
+    stream.phase.send_replace(Phase::Ended);
+    let _ = stream.live.send(None);
+}
+
+/// Runs ffmpeg in real time and splits its fragmented MP4 into the init segment and moof+mdat
+/// fragments, keeping the current GOP cached.
+async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestream) -> io::Result<()> {
+    let def = &CAMERAS[camera];
+    let size = match channel {
+        0 => "1280x720",
+        1 => "960x540",
+        _ => "640x360",
+    };
+    let filter = if mock.drawtext {
+        format!(
+            "drawtext=text='{} · live  %{{localtime\\:%T}}':fontcolor=white:fontsize=h/12:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=(h-th)/2",
+            def.name
+        )
+    } else {
+        format!("hue=h={}", def.hue)
+    };
+    let mut ffmpeg = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc2=size={size}:rate=30"))
+        .args(["-vf", &filter, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"])
+        .args(["-g", "30", "-pix_fmt", "yuv420p", "-f", "mp4"])
+        .args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "100000", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = ffmpeg.stdout.take().ok_or_else(|| io::Error::other("ffmpeg has no stdout"))?;
+    eprintln!("mock: livestream {} channel {channel} encoding", def.name);
+
+    let (mut buf, mut init, mut moof) = (Vec::with_capacity(1 << 20), Vec::new(), None::<Vec<u8>>);
+    loop {
+        let mut offset = 0;
+        while let Some((kind, size)) = box_header(&buf[offset..]) {
+            let Some(item) = buf.get(offset..offset + size) else { break };
+            match &kind {
+                b"ftyp" => init.extend_from_slice(item),
+                b"moov" => {
+                    init.extend_from_slice(item);
+                    stream.cache().init = std::mem::take(&mut init);
+                    stream.phase.send_replace(Phase::Ready);
+                }
+                b"moof" => moof = Some(item.to_vec()),
+                b"mdat" => {
+                    if let Some(moof) = moof.take() {
+                        let keyframe = first_sample_is_sync(&moof);
+                        let fragment = Arc::new(Fragment { moof, mdat: item.to_vec() });
+                        let mut cache = stream.cache();
+                        if keyframe {
+                            cache.fragments.clear();
+                        }
+                        if keyframe || !cache.fragments.is_empty() {
+                            cache.fragments.push(fragment.clone());
+                        }
+                        // Sent under the cache lock so a joining viewer sees each fragment once.
+                        let _ = stream.live.send(Some(fragment));
+                    }
+                }
+                _ => {}
+            }
+            offset += size;
+        }
+        buf.drain(..offset);
+        if stdout.read_buf(&mut buf).await? == 0 {
+            break;
+        }
+    }
+    let status = ffmpeg.wait().await?;
+    Err(io::Error::other(format!("ffmpeg exited ({status})")))
+}
+
+/// Type and total size of the ISO-BMFF box at the start of `data`, once its header is complete.
+fn box_header(data: &[u8]) -> Option<([u8; 4], usize)> {
+    let size = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?) as usize;
+    let kind: [u8; 4] = data.get(4..8)?.try_into().ok()?;
+    let size = if size == 1 { u64::from_be_bytes(data.get(8..16)?.try_into().ok()?) as usize } else { size };
+    (size >= 8).then_some((kind, size))
+}
+
+/// Payload of the first child box of type `kind` within `data` (a sequence of boxes).
+fn child<'a>(mut data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+    while let Some((found, size)) = box_header(data) {
+        let item = data.get(..size)?;
+        if &found == kind {
+            return item.get(8..);
+        }
+        data = &data[size..];
+    }
+    None
+}
+
+/// Whether a fragment starts on a keyframe: the first sample's `sample_is_non_sync_sample` flag,
+/// from trun (first-sample or per-sample flags) or the tfhd default.
+fn first_sample_is_sync(moof: &[u8]) -> bool {
+    let read = |data: &[u8], at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let is_sync = |flags: u32| flags & 0x0001_0000 == 0;
+    let Some(traf) = moof.get(8..).and_then(|boxes| child(boxes, b"traf")) else { return false };
+    if let Some(trun) = child(traf, b"trun") {
+        let flags = read(trun, 0).unwrap_or(0) & 0x00ff_ffff;
+        let mut at = 8 + if flags & 0x1 != 0 { 4 } else { 0 };
+        if flags & 0x4 != 0 {
+            return read(trun, at).is_some_and(is_sync);
+        }
+        if flags & 0x400 != 0 {
+            at += if flags & 0x100 != 0 { 4 } else { 0 } + if flags & 0x200 != 0 { 4 } else { 0 };
+            return read(trun, at).is_some_and(is_sync);
+        }
+    }
+    let Some(tfhd) = child(traf, b"tfhd") else { return false };
+    let flags = read(tfhd, 0).unwrap_or(0) & 0x00ff_ffff;
+    if flags & 0x20 == 0 {
+        return false;
+    }
+    let at = 8
+        + if flags & 0x1 != 0 { 8 } else { 0 }
+        + [0x2, 0x8, 0x10].iter().filter(|bit| flags & *bit != 0).count() * 4;
+    read(tfhd, at).is_some_and(is_sync)
+}
+
+/// Livestream wire framing: `[type u8][length u24 BE][payload]` (hjdhjd/unifi-protect
+/// src/transport/livestream-session.ts).
+mod frame {
+    pub const CODEC: u8 = 248;
+    pub const BEGIN: u8 = 249;
+    pub const INIT: u8 = 250;
+    pub const MOOF: u8 = 251;
+    pub const MDAT: u8 = 254;
+    pub const END: u8 = 255;
+}
+
+fn push_frame(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    out.extend_from_slice(payload);
+}
+
+/// One media segment: begin, moof and mdat in `chunk_size` pieces, end.
+fn push_fragment(out: &mut Vec<u8>, fragment: &Fragment, chunk_size: usize) {
+    push_frame(out, frame::BEGIN, &[]);
+    for piece in fragment.moof.chunks(chunk_size) {
+        push_frame(out, frame::MOOF, piece);
+    }
+    for piece in fragment.mdat.chunks(chunk_size) {
+        push_frame(out, frame::MDAT, piece);
+    }
+    push_frame(out, frame::END, &[]);
+}
+
+/// Sends `out` as binary messages whose boundaries deliberately ignore frame boundaries, so
+/// clients must reassemble frames across messages.
+async fn flush<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, out: &mut Vec<u8>, chunk_size: usize) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for piece in out.chunks(chunk_size + 1000) {
+        ws.send(Message::binary(piece.to_vec())).await.map_err(io::Error::other)?;
+    }
+    out.clear();
+    Ok(())
+}
+
+/// A livestream viewer: codec string, init segment and the cached GOP at once, then live fragments.
+async fn livestream_socket(mock: Arc<Mock>, stream: Rewind, target: LivestreamTarget) -> io::Result<()> {
+    let mut ws = tokio_tungstenite::accept_async(stream).await.map_err(io::Error::other)?;
+    let name = CAMERAS[target.camera].name;
+    eprintln!("mock: livestream {name} channel {} open", target.channel);
+    let source = mock.livestream(target.camera, target.channel);
+    let mut phase = source.phase.subscribe();
+    if !phase.wait_for(|p| *p != Phase::Starting).await.is_ok_and(|p| *p == Phase::Ready) {
+        return ws.close(None).await.map_err(io::Error::other);
+    }
+    let (init, cached, mut live) = {
+        let cache = source.cache();
+        (cache.init.clone(), cache.fragments.clone(), source.live.subscribe())
+    };
+    let mut out = Vec::with_capacity(init.len() + 64 * 1024);
+    push_frame(&mut out, frame::CODEC, b"avc1.64001f");
+    push_frame(&mut out, frame::INIT, &init);
+    for fragment in &cached {
+        push_fragment(&mut out, fragment, target.chunk_size);
+    }
+    flush(&mut ws, &mut out, target.chunk_size).await?;
+    loop {
+        tokio::select! {
+            fragment = live.recv() => match fragment {
+                Ok(Some(fragment)) => {
+                    push_fragment(&mut out, &fragment, target.chunk_size);
+                    if flush(&mut ws, &mut out, target.chunk_size).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(None) | Err(broadcast::error::RecvError::Closed) => {
+                    let _ = ws.close(None).await;
+                    break;
+                }
+            },
+            incoming = ws.next() => match incoming {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    eprintln!("mock: livestream {name} channel {} closed", target.channel);
     Ok(())
 }
 
