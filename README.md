@@ -136,6 +136,8 @@ sauron check                      # test the connection and list cameras
 sauron cameras                    # list cameras
 sauron live "front door"          # open a live feed (camera id, name, or unique prefix)
 sauron snapshot driveway          # save a snapshot to ./Driveway.jpg
+sauron log --since 24h            # Protect's event history as JSON Lines (see below)
+sauron thumbnail <event-id>       # save Protect's picture of an event
 omarchy-shell sauron toggle       # open or close the panel
 omarchy-shell sauron latest       # live feed of the latest detection
 omarchy-shell sauron silence 60   # silence for 60 minutes (0 = until woken)
@@ -144,6 +146,53 @@ omarchy-shell sauron status       # connection status
 ```
 
 Bind any of these in `~/.config/hypr/bindings.lua`.
+
+## Event log and history
+
+Sauron can hand detections to your own scripts: a log to tail, Protect's history to query, and pictures for both.
+
+**Event log.** Set `event_log` in `~/.config/sauron/config.toml` and Sauron appends every camera event to that file as [JSON Lines](https://jsonlines.org): one line when a detection starts and one when it ends.
+
+```toml
+event_log = "~/.local/state/sauron/events.jsonl"
+```
+
+```json
+{"phase":"start","id":"…","camera":"Front Door","camera_id":"…","type":"smartDetectZone","kinds":["person"],"match":true,"start":"2026-09-29T14:02:11.482-05:00","end":null,"duration_s":null}
+{"phase":"end","id":"…","camera":"Front Door","camera_id":"…","type":"smartDetectZone","kinds":["person","vehicle"],"match":true,"start":"2026-09-29T14:02:11.482-05:00","end":"2026-09-29T14:02:18.901-05:00","duration_s":7.4}
+```
+
+- **What's included.** Every camera event goes in, motion too. `match` says whether it was one you're alerted to.
+- **Picking lines.** React to `start` lines while something's happening, and read `end` lines for a record of what happened.
+- **Rotation.** Sauron reopens the file for every line, so rotate it however you like (logrotate, a cron job, `mv`) with no signals needed. A handful of cameras produce around 100 KB a day.
+- **Gaps.** The log only covers time Sauron was running: not while your machine sleeps or you're away without a VPN. Protect's history has no gaps.
+
+**Protect's history.** `sauron log` prints Protect's own event history in the same shape, oldest first. It needs the [instant live](#instant-live-video-optional) service account, because Protect only shares its history with a login.
+
+```bash
+sauron log                         # the last 24 hours
+sauron log --since 7d | jq -c 'select(.kinds | index("person"))'
+sauron log --since 2026-09-01 --until 2026-09-02
+sauron log --all                   # also logins, presence, and device events
+```
+
+**Pictures.** `sauron snapshot <camera>` saves what a camera sees now; `sauron thumbnail <event-id>` saves Protect's picture of an event.
+
+For example, to have a local vision model describe each person as they appear:
+
+```bash
+ollama pull qwen2.5vl:3b
+tail -Fn0 ~/.local/state/sauron/events.jsonl |
+  jq --unbuffered -r 'select(.phase == "start" and (.kinds | index("person"))) | [.camera_id, .camera] | @tsv' |
+  while IFS=$'\t' read -r id name; do
+    img=$(sauron snapshot "$id" "/tmp/sauron-$id.jpg")
+    jq -n --arg img "$(base64 -w0 "$img")" \
+      '{model: "qwen2.5vl:3b", stream: false, images: [$img],
+        prompt: "In one sentence, describe the person in this security camera image."}' |
+      curl -s http://127.0.0.1:11434/api/generate -d @- |
+      jq -r --arg name "$name" '"\($name): \(.response)"'
+  done
+```
 
 ## Settings
 
@@ -170,6 +219,7 @@ fallback_hosts = []       # other addresses for the same console, e.g. ["unifi.t
 cert_sha256 = "AB:CD:…"   # the console's certificate, recorded by sauron setup
 api_key = "…"             # or api_key_command = "secret-tool lookup service sauron"
 username = "sauron"       # service account for instant live; its password is in your keyring
+event_log = ""            # append camera events here as JSON Lines, e.g. "~/.local/state/sauron/events.jsonl"
 live_quality = "high"     # high | medium | low
 player = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-window=immediate"]
 ```

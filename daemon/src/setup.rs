@@ -84,6 +84,7 @@ fn probe_config(host: &str, pin: Option<Fingerprint>) -> Config {
         username: String::new(),
         live_quality: String::new(),
         player: Vec::new(),
+        event_log: None,
     }
 }
 

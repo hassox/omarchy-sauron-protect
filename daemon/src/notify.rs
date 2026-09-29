@@ -115,14 +115,8 @@ fn push_display_kind(out: &mut String, kind: &str) {
 
 /// Local wall-clock `HH:MM:SS` for a Unix-ms timestamp.
 fn local_hms(ms: i64) -> String {
-    let secs = ms.div_euclid(1000) as libc::time_t;
-    // SAFETY: localtime_r only writes into the zeroed `tm` we own; a null return is handled.
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&secs, &mut tm).is_null() {
-            return String::from("--:--:--");
-        }
-        tm
-    };
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    match crate::event_log::local_tm(ms) {
+        Some(tm) => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+        None => String::from("--:--:--"),
+    }
 }
