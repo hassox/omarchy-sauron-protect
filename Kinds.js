@@ -53,3 +53,14 @@ function clock(ms) {
   var h = d.getHours(), m = d.getMinutes()
   return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m
 }
+
+// Newest sighting first by when it started, not when it arrived: Protect reports
+// some detections late (sound; packages only once they have ended).
+function addSighting(list, ev, limit) {
+  var out = list.slice()
+  var i = 0
+  while (i < out.length && out[i].start > ev.start) i++
+  out.splice(i, 0, ev)
+  if (out.length > limit) out.length = limit
+  return out
+}

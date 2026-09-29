@@ -336,9 +336,7 @@ Item {
 
     lastAlertCamera = ev.camera
     if (!watching && !silenced) unseen++
-    var list = [ev].concat(recent)
-    if (list.length > recentLimit) list.length = recentLimit
-    recent = list
+    recent = Kinds.addSighting(recent, ev, recentLimit)
   }
 
   function patchRecent(ev) {
