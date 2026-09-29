@@ -1,12 +1,14 @@
 //! Mock UniFi Protect console for end-to-end testing without cameras: the Integration API, the
 //! UniFi OS login and Protect's private livestream.
 //!
-//! `cargo run --example mock_protect -- [--port 7447] [--interval 20]`, then point sauron at
+//! `cargo run --example mock_protect -- [--port 7447] [--interval 20] [--scenes DIR]`, then point sauron at
 //! `host = "http://127.0.0.1:7447"` with `api_key = "mock"`; the UniFi OS user is `sauron` with
 //! password `mock` (user `mfa`, same password, behaves like an account with MFA enabled).
 //! `curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'` fires an event;
 //! `POST /mock/livestream?fail=true|false` breaks or repairs the livestream endpoint;
 //! `POST /mock/expire-sessions` logs every UniFi OS session out.
+//! `--scenes DIR` shows `DIR/<camera-name>.jpg` (e.g. `front-door.jpg`) instead of a test pattern,
+//! with a camera-style clock in the corner.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -98,11 +100,38 @@ struct Mock {
     events: broadcast::Sender<String>,
     devices: broadcast::Sender<String>,
     drawtext: bool,
+    scenes: Option<std::path::PathBuf>,
     port: u16,
     livestreams: Mutex<HashMap<(usize, u8), Arc<Livestream>>>,
 }
 
 impl Mock {
+    /// ffmpeg input arguments and filter for a camera's picture at `width`x`height`: its scene
+    /// photo (still, looped at `rate`) when one exists, else a tinted, labelled test pattern.
+    fn picture(&self, def: &CameraDef, width: u32, height: u32, rate: u32, label: &str) -> (Vec<String>, String) {
+        let scene = self.scenes.as_ref().map(|dir| dir.join(format!("{}.jpg", def.name.to_lowercase().replace(' ', "-"))));
+        if let Some(scene) = scene.filter(|path| path.is_file()) {
+            let input = ["-loop", "1", "-framerate", &rate.to_string(), "-i"].map(String::from).into_iter();
+            let mut filter = format!("scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}");
+            if self.drawtext {
+                filter.push_str(
+                    ",drawtext=text='%{localtime\\:%Y-%m-%d  %T}':fontcolor=white@0.9:fontsize=h/30:shadowcolor=black@0.8:shadowx=1:shadowy=1:x=w-tw-h/40:y=h-th-h/40",
+                );
+            }
+            return (input.chain([scene.to_string_lossy().into_owned()]).collect(), filter);
+        }
+        let input = ["-f", "lavfi", "-i"].map(String::from).into_iter();
+        let filter = if self.drawtext {
+            format!(
+                "drawtext=text='{}{label}  %{{localtime\\:%T}}':fontcolor=white:fontsize=h/10:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=(h-th)/2",
+                def.name
+            )
+        } else {
+            format!("hue=h={}", def.hue)
+        };
+        (input.chain([format!("testsrc2=size={width}x{height}:rate={rate}")]).collect(), filter)
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -190,14 +219,17 @@ fn now_ms() -> u64 {
 async fn main() -> io::Result<()> {
     let mut port: u16 = 7447;
     let mut interval_secs: u64 = 20;
+    let mut scenes = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        let value = args.next().and_then(|v| v.parse().ok());
-        match (arg.as_str(), value) {
+        let value = args.next();
+        let number = value.as_deref().and_then(|v| v.parse::<u64>().ok());
+        match (arg.as_str(), number) {
             ("--port", Some(v)) => port = u16::try_from(v).map_err(io::Error::other)?,
             ("--interval", Some(v)) if v > 0 => interval_secs = v,
+            ("--scenes", _) if value.is_some() => scenes = value.map(std::path::PathBuf::from),
             _ => {
-                eprintln!("usage: mock_protect [--port 7447] [--interval 20]");
+                eprintln!("usage: mock_protect [--port 7447] [--interval 20] [--scenes DIR]");
                 std::process::exit(2);
             }
         }
@@ -216,6 +248,7 @@ async fn main() -> io::Result<()> {
         events: broadcast::channel(64).0,
         devices: broadcast::channel(64).0,
         drawtext: has_drawtext().await,
+        scenes,
         port,
         livestreams: Mutex::new(HashMap::new()),
     });
@@ -470,19 +503,11 @@ fn stream_url(index: usize, quality: &str) -> String {
 }
 
 async fn render_snapshot(mock: &Mock, index: usize, high_quality: bool) -> io::Result<Vec<u8>> {
-    let camera = &CAMERAS[index];
-    let size = if high_quality { "1920x1080" } else { "640x360" };
-    let filter = if mock.drawtext {
-        format!(
-            "drawtext=text='{}  %{{localtime\\:%T}}':fontcolor=white:fontsize=h/10:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=(h-th)/2",
-            camera.name
-        )
-    } else {
-        format!("hue=h={}", camera.hue)
-    };
+    let (width, height) = if high_quality { (1920, 1080) } else { (640, 360) };
+    let (input, filter) = mock.picture(&CAMERAS[index], width, height, 1, "");
     let output = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
-        .arg(format!("testsrc2=size={size}:rate=1"))
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(&input)
         .args(["-frames:v", "1", "-vf", &filter, "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "pipe:1"])
         .stdin(Stdio::null())
         .output()
@@ -697,22 +722,15 @@ async fn encode(mock: Arc<Mock>, camera: usize, channel: u8, stream: Arc<Livestr
 /// fragments, keeping the current GOP cached.
 async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestream) -> io::Result<()> {
     let def = &CAMERAS[camera];
-    let size = match channel {
-        0 => "1280x720",
-        1 => "960x540",
-        _ => "640x360",
+    let (width, height) = match channel {
+        0 => (1280, 720),
+        1 => (960, 540),
+        _ => (640, 360),
     };
-    let filter = if mock.drawtext {
-        format!(
-            "drawtext=text='{} · live  %{{localtime\\:%T}}':fontcolor=white:fontsize=h/12:box=1:boxcolor=black@0.6:boxborderw=8:x=(w-tw)/2:y=(h-th)/2",
-            def.name
-        )
-    } else {
-        format!("hue=h={}", def.hue)
-    };
+    let (input, filter) = mock.picture(def, width, height, 30, " · live");
     let mut ffmpeg = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i"])
-        .arg(format!("testsrc2=size={size}:rate=30"))
+        .args(["-hide_banner", "-loglevel", "error", "-re"])
+        .args(&input)
         .args(["-vf", &filter, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"])
         .args(["-g", "30", "-pix_fmt", "yuv420p", "-f", "mp4"])
         .args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "100000", "pipe:1"])

@@ -168,11 +168,17 @@ async fn ask_instant_live(settings: &mut Settings, client: &Protect, cameras: &[
     let mut username = settings.username.trim().to_owned();
     loop {
         username = input("UniFi username", &username, "local-only user", false).await?;
-        let password = input("Password", "", "", true).await?;
-        if username.is_empty() || password.is_empty() {
-            fail("Both the username and the password are needed");
+        if username.is_empty() {
+            fail("A username is needed");
             continue;
         }
+        let saved = keyring::lookup(&client.console_id(), &username).await;
+        let placeholder = if saved.is_some() { "Enter keeps the saved password" } else { "" };
+        let typed = input("Password", "", placeholder, true).await?;
+        let Some(password) = Some(typed).filter(|p| !p.is_empty()).or(saved) else {
+            fail("A password is needed");
+            continue;
+        };
         let mut api = PrivateApi::new(client, &username, password.clone());
         let verified = spin("Logging in…", async {
             api.login().await?;
