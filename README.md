@@ -1,13 +1,13 @@
 # Sauron
 
-The Eye of Sauron for [Omarchy](https://omarchy.org): an eye in the bar that watches your UniFi Protect cameras.
+The Eye of Sauron for [Omarchy](https://omarchy.org): Barad-dûr in your bar, its eye watching your UniFi Protect cameras.
 
-- **The eye** lights up with fire when a detection you care about (person, vehicle, package, doorbell, …) is happening, and keeps a glow until you look.
+- **The eye** flickers when a detection you care about (person, vehicle, package, doorbell, …) is happening, and its pupil stays wide until you look.
 - **Click it** for a live-refreshing grid of snapshots from every camera, the detection filters, silence controls, and recent sightings.
 - **Click a camera** to open its live feed in `mpv`.
 - **Notifications** come with a snapshot, and clicking one opens that camera live.
 
-It follows the active Omarchy theme: fonts, spacing, corner radius, and the foreground, accent, and urgent colours.
+It follows the active Omarchy theme: the tower, fonts, spacing, corner radius, and the foreground, accent, and urgent colours. The eye itself is always fire.
 
 ## How it fits together
 
@@ -91,15 +91,15 @@ What the eye shows:
 | Eye | Meaning |
 |---|---|
 | Open | Watching |
-| Burning, pulsing | A detection you care about is happening |
-| Embers | You missed sightings; they clear when you open the panel |
+| Flickering, pupil wide | A detection you care about is happening |
+| Pupil wide | You missed sightings; it narrows when you open the panel |
 | Half-closed | Silenced |
-| Closed, dim | Not connected, not configured, or the daemon isn't installed |
+| Shut, tower dim | Not connected, not configured, or the daemon isn't installed |
 
 ### Silence and Do Not Disturb
 
 - **Silence** (from the panel, a middle click, or `s`) stops Sauron's notifications and keeps the eye calm. You can silence for 30 minutes, 1 hour, 8 hours, or until you wake it. Sightings are still recorded in the panel while silenced.
-- **Omarchy's Do Not Disturb** is honoured as-is. The notification server files Sauron's notifications straight into history (all of them are sent at normal urgency, so none bypass it), and the eye stops pulsing.
+- **Omarchy's Do Not Disturb** is honoured as-is. The notification server files Sauron's notifications straight into history (all of them are sent at normal urgency, so none bypass it), and the eye stops flickering.
 
 ### Command line and keybinds
 

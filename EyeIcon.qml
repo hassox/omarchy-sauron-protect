@@ -2,19 +2,24 @@ import QtQuick
 import QtQuick.Shapes
 import qs.Commons
 
-// The Eye: an almond lid around a vertical slit pupil, drawn natively so it
-// stays crisp in a 16px bar slot. `openness` lowers the upper lid (1 open,
-// 0 shut); `fire` floods the iris with flame in the theme's urgent colour.
+// The Eye of Sauron atop Barad-dûr, drawn natively so it stays crisp in a
+// 16px bar slot. The tower takes the theme colour; the eye is always fire
+// with a black slit. `openness` lowers the lid (1 open, 0 shut), `wary`
+// dilates the pupil, and `seeing` sets the flames moving.
 Item {
   id: root
 
   property real iconSize: Style.font.icon
   property color color: Color.foreground
-  property color fireColor: Color.urgent
-  property color pupilColor: Color.background
   property real openness: 1
-  property real fire: 0
-  property bool pulsing: false
+  property bool wary: false
+  property bool seeing: false
+
+  // Sampled from the reference art: burnt orange with hot highlights.
+  readonly property color fireCore: "#f6aa55"
+  readonly property color fireMid: "#dc6a2a"
+  readonly property color fireEdge: "#a33d1a"
+  readonly property color pupilColor: "#120806"
 
   implicitWidth: iconSize
   implicitHeight: iconSize
@@ -22,98 +27,113 @@ Item {
   property real lid: openness
   Behavior on lid { NumberAnimation { duration: Style.duration(360); easing.type: Easing.InOutCubic } }
 
-  property real heat: fire
-  Behavior on heat { NumberAnimation { duration: Style.duration(260); easing.type: Easing.OutCubic } }
+  property real dilation: wary ? 1 : 0
+  Behavior on dilation { NumberAnimation { duration: Style.duration(420); easing.type: Easing.OutCubic } }
 
-  property real flicker: 1
-  SequentialAnimation on flicker {
-    running: root.pulsing && root.fire > 0 && !Style.reduceMotion
+  // Two unsynchronised drifts keep the flames from looking like a metronome.
+  property real flame: 0
+  property real drift: 0
+  SequentialAnimation on flame {
+    running: root.seeing && !Style.reduceMotion
     loops: Animation.Infinite
-    onRunningChanged: if (!running) root.flicker = 1
-    NumberAnimation { to: 0.5; duration: 640; easing.type: Easing.InOutSine }
-    NumberAnimation { to: 1; duration: 860; easing.type: Easing.InOutSine }
+    onRunningChanged: if (!running) root.flame = 0
+    NumberAnimation { to: 1; duration: 540; easing.type: Easing.InOutSine }
+    NumberAnimation { to: 0.2; duration: 760; easing.type: Easing.InOutSine }
+  }
+  SequentialAnimation on drift {
+    running: root.seeing && !Style.reduceMotion
+    loops: Animation.Infinite
+    onRunningChanged: if (!running) root.drift = 0
+    NumberAnimation { to: 1; duration: 1300; easing.type: Easing.InOutSine }
+    NumberAnimation { to: -1; duration: 1700; easing.type: Easing.InOutSine }
   }
 
-  readonly property real stroke: Math.max(1.2, iconSize * 0.085)
-  readonly property real cornerL: stroke / 2
-  readonly property real cornerR: iconSize - stroke / 2
-  readonly property real mid: iconSize / 2
-  // A quadratic curve peaks halfway to its control point, so a control
-  // `reach` away puts each lid's apex at reach / 2 from the centre line.
-  readonly property real reach: iconSize * 0.56
-  readonly property real upper: mid - reach + 2 * reach * (1 - lid)
-  readonly property real lower: mid + reach
-  // The slit hangs from under the upper lid, so a lowered lid hides its top.
-  readonly property real pupilTop: Math.max(mid - iconSize * 0.22, (mid + upper) / 2 + stroke * 0.7)
-  readonly property real pupilBottom: mid + iconSize * 0.22
-  readonly property real pupilMid: (pupilTop + pupilBottom) / 2
-  readonly property bool pupilVisible: pupilBottom - pupilTop > stroke
-  readonly property real slitWidth: iconSize * (0.11 + 0.07 * heat)
+  readonly property real u: iconSize
+
+  // ---------------------------------------------------------------- tower
+  readonly property real outerL: u * 0.06
+  readonly property real outerR: u * 0.94
+  readonly property real tipY: 0
+  readonly property real shoulderY: u * 0.8
+  readonly property real shaftY: u * 0.88
+  readonly property real shaftL: u * 0.26
+  readonly property real shaftR: u * 0.74
+  // The cradle is one cubic; its lowest point sits at tipY + 0.75 * cradleDepth.
+  readonly property real cradleDepth: u * 0.907
+
+  // ---------------------------------------------------------------- eye
+  // Set low enough in the cradle that the horns rise well above it.
+  readonly property real cx: u / 2
+  readonly property real eyeY: u * 0.34
+  readonly property real eyeHalf: u * 0.37
+  // A quadratic lid peaks halfway to its control point.
+  readonly property real reach: u * 0.36
+  readonly property real upper: eyeY - reach + 2 * reach * (1 - lid)
+  readonly property real lower: eyeY + reach
+  readonly property real pupilTop: (eyeY + upper) / 2 + u * 0.02
+  readonly property real pupilBottom: (eyeY + lower) / 2 - u * 0.02
+  readonly property bool pupilVisible: pupilBottom - pupilTop > u * 0.06
+  readonly property real slit: u * (0.11 + 0.08 * dilation + 0.02 * flame)
 
   function mix(a, b, t) {
     return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t)
   }
 
-  // Lid curve height at parameter t (the lower lid; x is linear in t).
-  function lidY(t) { return mid + 2 * t * (1 - t) * reach }
-  function lidX(t) { return cornerL + (cornerR - cornerL) * t }
-  readonly property real lashLength: iconSize * 0.15
-  readonly property real lashAlpha: Math.max(0, 1 - lid * 2.5)
-
   Shape {
     anchors.fill: parent
     preferredRendererType: Shape.CurveRenderer
-    // A shut eye is only the lower curve; lift it back to the optical centre.
-    // Squared so a half-lowered lid stays near centre and only a shut one lifts.
-    transform: Translate { y: -root.reach * 0.36 * (1 - root.lid) * (1 - root.lid) }
 
+    // Barad-dûr: two horns cupping the eye, stepping in to the shaft.
+    ShapePath {
+      strokeColor: "transparent"
+      fillColor: root.color
+      startX: root.outerL; startY: root.tipY
+      PathLine { x: root.outerL; y: root.shoulderY }
+      PathLine { x: root.shaftL; y: root.shaftY }
+      PathLine { x: root.shaftL; y: root.u }
+      PathLine { x: root.shaftR; y: root.u }
+      PathLine { x: root.shaftR; y: root.shaftY }
+      PathLine { x: root.outerR; y: root.shoulderY }
+      PathLine { x: root.outerR; y: root.tipY }
+      PathCubic {
+        x: root.outerL; y: root.tipY
+        control1X: root.outerR; control1Y: root.tipY + root.cradleDepth
+        control2X: root.outerL; control2Y: root.tipY + root.cradleDepth
+      }
+    }
+  }
+
+  // A shut lid leaves a zero-area eye that would still rasterise as a hairline.
+  Shape {
+    anchors.fill: parent
+    visible: root.lid > 0.03
+    preferredRendererType: Shape.CurveRenderer
+
+    // The eye: fire between the lids.
     ShapePath {
       strokeColor: "transparent"
       fillGradient: RadialGradient {
-        centerX: root.mid
-        centerY: root.mid
-        centerRadius: root.iconSize * 0.46
-        focalX: root.mid
-        focalY: root.mid
-        GradientStop { position: 0.0; color: Util.alpha(Qt.lighter(root.fireColor, 1.7), root.heat * root.flicker) }
-        GradientStop { position: 0.5; color: Util.alpha(root.fireColor, 0.9 * root.heat * root.flicker) }
-        GradientStop { position: 1.0; color: Util.alpha(root.fireColor, 0.15 * root.heat) }
+        centerX: root.cx
+        centerY: root.eyeY
+        centerRadius: root.eyeHalf
+        focalX: root.cx + root.drift * root.u * 0.08
+        focalY: root.eyeY - root.flame * root.u * 0.03
+        GradientStop { position: 0.0; color: root.mix(root.fireCore, "#ffe2a0", root.flame * 0.6) }
+        GradientStop { position: 0.55; color: root.mix(root.fireMid, root.fireCore, root.flame * 0.35) }
+        GradientStop { position: 1.0; color: root.fireEdge }
       }
-      startX: root.cornerL; startY: root.mid
-      PathQuad { x: root.cornerR; y: root.mid; controlX: root.mid; controlY: root.upper }
-      PathQuad { x: root.cornerL; y: root.mid; controlX: root.mid; controlY: root.lower }
+      startX: root.cx - root.eyeHalf; startY: root.eyeY
+      PathQuad { x: root.cx + root.eyeHalf; y: root.eyeY; controlX: root.cx; controlY: root.upper }
+      PathQuad { x: root.cx - root.eyeHalf; y: root.eyeY; controlX: root.cx; controlY: root.lower }
     }
 
-    ShapePath {
-      strokeColor: root.color
-      strokeWidth: root.stroke
-      fillColor: "transparent"
-      capStyle: ShapePath.RoundCap
-      joinStyle: ShapePath.RoundJoin
-      startX: root.cornerL; startY: root.mid
-      PathQuad { x: root.cornerR; y: root.mid; controlX: root.mid; controlY: root.upper }
-      PathQuad { x: root.cornerL; y: root.mid; controlX: root.mid; controlY: root.lower }
-    }
-
+    // The slit, hanging from under the upper lid.
     ShapePath {
       strokeColor: "transparent"
-      fillColor: root.pupilVisible ? root.mix(root.color, root.pupilColor, root.heat) : "transparent"
-      startX: root.mid; startY: root.pupilTop
-      PathQuad { x: root.mid; y: root.pupilBottom; controlX: root.mid + root.slitWidth; controlY: root.pupilMid }
-      PathQuad { x: root.mid; y: root.pupilTop; controlX: root.mid - root.slitWidth; controlY: root.pupilMid }
-    }
-
-    ShapePath {
-      strokeColor: Util.alpha(root.color, root.color.a * root.lashAlpha)
-      strokeWidth: root.stroke * 0.85
-      fillColor: "transparent"
-      capStyle: ShapePath.RoundCap
-      startX: root.lidX(0.25); startY: root.lidY(0.25)
-      PathLine { x: root.lidX(0.25) - root.lashLength * 0.45; y: root.lidY(0.25) + root.lashLength * 0.8 }
-      PathMove { x: root.lidX(0.5); y: root.lidY(0.5) }
-      PathLine { x: root.lidX(0.5); y: root.lidY(0.5) + root.lashLength }
-      PathMove { x: root.lidX(0.75); y: root.lidY(0.75) }
-      PathLine { x: root.lidX(0.75) + root.lashLength * 0.45; y: root.lidY(0.75) + root.lashLength * 0.8 }
+      fillColor: root.pupilVisible ? root.pupilColor : "transparent"
+      startX: root.cx; startY: root.pupilTop
+      PathQuad { x: root.cx; y: root.pupilBottom; controlX: root.cx + root.slit; controlY: (root.pupilTop + root.pupilBottom) / 2 }
+      PathQuad { x: root.cx; y: root.pupilTop; controlX: root.cx - root.slit; controlY: (root.pupilTop + root.pupilBottom) / 2 }
     }
   }
 }

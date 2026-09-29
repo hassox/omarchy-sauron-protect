@@ -37,9 +37,11 @@ Panel {
   readonly property int unseen: sauron ? sauron.unseen : 0
 
   // ------------------------------------------------------------ the eye
-  readonly property real eyeOpenness: online ? (silenced ? 0.38 : 1) : (status === "starting" || status === "connecting" ? 0.55 : 0)
-  readonly property real eyeFire: !online || silenced ? 0 : (alerting ? 1 : (unseen > 0 ? 0.5 : 0))
-  readonly property bool eyePulsing: alerting && !silenced && !dnd
+  readonly property real eyeOpenness: online ? (silenced ? 0.4 : 1) : 0
+  // Dilated: something was seen (now, or since the panel was last opened).
+  readonly property bool eyeWary: online && !silenced && (alerting || unseen > 0)
+  // Flames move only while a detection is live and nothing asks for quiet.
+  readonly property bool eyeSeeing: alerting && !silenced && !dnd
 
   readonly property string silenceUntilText: {
     if (!sauron || !silenced) return ""
@@ -50,35 +52,13 @@ Panel {
     ? Kinds.describe(sauron.alertKinds) + " · " + sauron.cameraName(sauron.alertCamera)
     : ""
 
-  property int phraseIndex: 0
-  readonly property var phrases: [
-    "Watching " + (sauron ? sauron.onlineCount : 0) + " of " + cameras.length + " cameras",
-    "The eye is ever watchful",
-    "Nothing passes unseen",
-    "All is quiet on the borders"
-  ]
-
-  readonly property string heroMeta: {
-    switch (status) {
-    case "missing": return "The daemon is not installed"
-    case "unconfigured": return "The eye is closed"
-    case "auth": return "Protect rejected the API key"
-    case "offline": return "The eye is clouded"
-    case "outdated": return "The daemon is out of date"
-    case "online":
-      if (silenced) return silenceUntilText !== "" ? "Resting until " + silenceUntilText : "Resting until you wake it"
-      if (alerting) return alertText
-      if (dnd) return "Watching quietly · Do Not Disturb"
-      return phrases[phraseIndex % phrases.length]
-    default: return "Opening the eye"
-    }
-  }
+  readonly property string heroMeta: online ? (alerting ? alertText : (dnd ? "Do Not Disturb" : "")) : ""
 
   readonly property string attentionText: {
     if (!sauron) return ""
     switch (status) {
-    case "missing": return "Build and install the sauron daemon, then this panel wakes up on its own:\n" + sauron.message
-    case "unconfigured": return (sauron.message !== "" ? sauron.message + "\n" : "") + "Run `sauron config`, then add your console host and a Protect API key (Protect › Settings › Control Plane › Integrations)."
+    case "missing": return "Build and install the sauron daemon:\n" + sauron.message
+    case "unconfigured": return (sauron.message !== "" ? sauron.message + "\n" : "") + "Add your console host and a Protect API key (Protect › Settings › Control Plane › Integrations)."
     case "auth": return "Protect rejected the API key. Check api_key in ~/.config/sauron/config.toml."
     case "offline": return sauron.message
     case "outdated": return sauron.message
@@ -87,10 +67,17 @@ Panel {
   }
 
   readonly property string tooltip: {
-    if (status !== "online") return "Sauron · " + heroMeta
-    if (silenced) return "Sauron · " + heroMeta
-    if (alerting) return alertText
-    return "Sauron · watching " + (sauron ? sauron.onlineCount : 0) + " cameras"
+    switch (status) {
+    case "missing": return "Sauron · daemon not installed"
+    case "unconfigured": return "Sauron · not configured"
+    case "auth": return "Sauron · API key rejected"
+    case "offline": return "Sauron · offline"
+    case "outdated": return "Sauron · daemon out of date"
+    case "online":
+      if (alerting) return alertText
+      return "Sauron · " + (sauron ? sauron.onlineCount : 0) + "/" + cameras.length + " cameras" + (silenced ? " · silenced" : "")
+    default: return "Sauron · connecting"
+    }
   }
 
   // ------------------------------------------------------------ grid geometry
@@ -228,19 +215,11 @@ Panel {
     if (sauron) sauron.setWatching(watchKey, opened)
     if (!opened) return
     cursorActive = false
-    phraseIndex = 0
     if (panelFlick) panelFlick.contentY = 0
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onSectionsChanged: if (cursorActive) ensureCursor()
   Component.onDestruction: if (sauron) sauron.setWatching(watchKey, false)
-
-  Timer {
-    interval: 6000
-    repeat: true
-    running: root.opened && root.online && !root.alerting && !root.silenced
-    onTriggered: root.phraseIndex++
-  }
 
   BarIconButton {
     id: button
@@ -253,11 +232,9 @@ Panel {
           anchors.centerIn: parent
           iconSize: Style.bar.iconCanvas
           color: root.online ? root.barForeground : Qt.darker(root.barForeground, 1.55)
-          fireColor: root.urgent
-          pupilColor: Color.bar.background
           openness: root.eyeOpenness
-          fire: root.eyeFire
-          pulsing: root.eyePulsing
+          wary: root.eyeWary
+          seeing: root.eyeSeeing
         }
       }
     }
@@ -321,11 +298,9 @@ Panel {
               EyeIcon {
                 iconSize: Style.space(34)
                 color: root.online ? root.foreground : root.dim
-                fireColor: root.urgent
-                pupilColor: Color.popups.background
                 openness: root.eyeOpenness
-                fire: root.eyeFire
-                pulsing: root.eyePulsing
+                wary: root.eyeWary
+                seeing: root.eyeSeeing
               }
             }
             trailingControl: Component {
@@ -525,7 +500,7 @@ Panel {
 
     property real pulse: 1
     SequentialAnimation on pulse {
-      running: tile.hot && root.eyePulsing && root.opened && !Style.reduceMotion
+      running: tile.hot && root.eyeSeeing && root.opened && !Style.reduceMotion
       loops: Animation.Infinite
       onRunningChanged: if (!running) tile.pulse = 1
       NumberAnimation { to: 0.45; duration: 640; easing.type: Easing.InOutSine }
@@ -542,14 +517,6 @@ Panel {
       path: tile.modelData.snapshot
       seq: root.snapshots[tile.modelData.id] || 0
       opacity: tile.modelData.online ? 1 : 0.45
-    }
-
-    EyeIcon {
-      visible: !still.ready
-      anchors.centerIn: parent
-      iconSize: Style.space(28)
-      color: root.dim
-      openness: tile.modelData.online ? 0.55 : 0
     }
 
     Rectangle {
@@ -638,7 +605,7 @@ Panel {
       borderSpec: tile.hot
         ? Border.flat(root.urgent, Math.max(2, Style.space(2)))
         : Border.controlSpec("normal", root.foreground, Color.accent)
-      opacity: tile.hot && root.eyePulsing ? tile.pulse : 1
+      opacity: tile.hot && root.eyeSeeing ? tile.pulse : 1
     }
 
     // Photos swallow the kit's subtle hover border, so the cursor gets a solid
