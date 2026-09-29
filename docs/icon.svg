@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Barad-dûr and the Eye, drawn with the same geometry as EyeIcon.qml at an 80px icon size. -->
+  <defs>
+    <radialGradient id="fire" gradientUnits="userSpaceOnUse" cx="40" cy="27.2" r="29.6">
+      <stop offset="0" stop-color="#f6aa55"/>
+      <stop offset="0.55" stop-color="#dc6a2a"/>
+      <stop offset="1" stop-color="#a33d1a"/>
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0e091d"/>
+  <g transform="translate(24 24)">
+    <path fill="#14b9b5" d="M4.8 0 L4.8 64 L20.8 70.4 L20.8 80 L59.2 80 L59.2 70.4 L75.2 64 L75.2 0 C75.2 72.56 4.8 72.56 4.8 0 Z"/>
+    <path fill="url(#fire)" d="M10.4 27.2 Q40 -1.6 69.6 27.2 Q40 56 10.4 27.2 Z"/>
+    <path fill="#120806" d="M40 14.4 Q48.8 27.2 40 40 Q31.2 27.2 40 14.4 Z"/>
+  </g>
+</svg>

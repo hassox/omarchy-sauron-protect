@@ -1,8 +1,16 @@
-# Sauron
+<p align="center">
+  <img src="docs/icon.svg" width="96" alt="">
+</p>
 
-An eye in your [Omarchy](https://omarchy.org) bar that watches your UniFi Protect cameras.
+<h1 align="center">Sauron</h1>
 
-![The Sauron panel: detection filters, silence controls, a live grid of camera snapshots with an active detection, and recent sightings](docs/panel.png)
+<p align="center">
+  An eye in your <a href="https://omarchy.org">Omarchy</a> bar that watches your UniFi Protect cameras.
+</p>
+
+<p align="center">
+  <img src="docs/panel.png" width="560" alt="The Sauron panel: detection filters, silence controls, a live grid of camera snapshots with an active detection, and recent sightings">
+</p>
 
 Sauron puts Barad-dûr in your status bar. When a camera sees something you care about (a person, a vehicle, a package, the doorbell), the Eye burns, a notification pops up with a snapshot, and one click opens the camera's live feed.
 
@@ -77,7 +85,9 @@ Then enter its username and password in `sauron setup`. The password is stored i
 | | `r` | Reconnect to Protect |
 | | Esc | Close |
 
-![Eye states: watching, a detection in progress, silenced, and not connected](docs/eye-states.png)
+<p align="center">
+  <img src="docs/eye-states.png" width="600" alt="Eye states: watching, a detection in progress, silenced, and not connected">
+</p>
 
 | Eye | Meaning |
 |---|---|
@@ -89,7 +99,9 @@ Then enter its username and password in `sauron setup`. The password is stored i
 
 ### Notifications
 
-![A detection notification with a camera snapshot](docs/notification.png)
+<p align="center">
+  <img src="docs/notification.png" width="420" alt="A detection notification with a camera snapshot">
+</p>
 
 A notification appears as soon as Protect reports a detection you've chosen, and gains a snapshot a moment later. Click it to open that camera live.
 
@@ -98,7 +110,9 @@ A notification appears as soon as Protect reports a detection you've chosen, and
 
 ### Live video
 
-![A live camera feed in mpv](docs/live.jpg)
+<p align="center">
+  <img src="docs/live.jpg" width="640" alt="A live camera feed in mpv">
+</p>
 
 Live feeds open in `mpv`, one window per camera. Opening a camera that's already open brings its window to the front.
 
