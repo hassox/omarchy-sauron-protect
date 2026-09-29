@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "id": "sauron",
+  "name": "Sauron",
+  "version": "0.1.0",
+  "author": "Daniel Neighman",
+  "description": "The Eye of Sauron: UniFi Protect detections, a live camera grid, and one-click live feeds in the Omarchy bar.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sauron",
+    "description": "An eye that lights up on UniFi Protect detections. Click for a live snapshot grid; click a camera for its live feed.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "notify": ["person", "vehicle", "package", "ring"],
+      "muted": [],
+      "desktop": true,
+      "snapshotIntervalSec": 2
+    },
+    "schema": [
+      {
+        "key": "notify",
+        "type": "multiselect",
+        "label": "Alert on",
+        "description": "Detections that light the eye and raise a notification.",
+        "noSelectionText": "Nothing",
+        "placeholderText": "Search detections...",
+        "emptyText": "No detections",
+        "options": [
+          { "value": "person", "label": "Person", "description": "Smart detection: person" },
+          { "value": "vehicle", "label": "Vehicle", "description": "Smart detection: vehicle" },
+          { "value": "animal", "label": "Animal", "description": "Smart detection: animal" },
+          { "value": "package", "label": "Package", "description": "Smart detection: package" },
+          { "value": "face", "label": "Face", "description": "Smart detection: face" },
+          { "value": "licensePlate", "label": "Plate", "description": "Smart detection: license plate" },
+          { "value": "ring", "label": "Doorbell", "description": "Doorbell ring" },
+          { "value": "audio", "label": "Sound", "description": "Smart audio: smoke, CO, siren, glass break, ..." },
+          { "value": "motion", "label": "Motion", "description": "Plain motion (noisy)" }
+        ]
+      },
+      {
+        "key": "desktop",
+        "type": "boolean",
+        "label": "Desktop notifications",
+        "description": "Raise a notification with a snapshot; clicking it opens the live feed.",
+        "defaultValue": true
+      },
+      {
+        "key": "snapshotIntervalSec",
+        "type": "integer",
+        "label": "Grid refresh (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 2
+      }
+    ]
+  }
+}
