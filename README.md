@@ -44,6 +44,17 @@ The install script:
 
 To update, run `omarchy plugin update sauron`, then run `install.sh` again so the daemon matches the plugin.
 
+### Uninstall
+
+```bash
+omarchy plugin remove sauron                 # takes the eye off the bar and deletes the plugin
+rm ~/.local/bin/sauron                       # the daemon
+rm -r ~/.config/sauron ~/.cache/sauron       # config (holds your API key) and build files
+secret-tool clear application sauron        # the service account's password, if you set one up
+```
+
+If you turned on the [event log](#event-log-and-history), delete that file too. In UniFi, you can then delete Sauron's API key (**Protect › Settings › Control Plane › Integrations**) and its service account (**Admins & Users**).
+
 ## Set up
 
 Run `sauron setup`, or click the eye and then **Set up**. The wizard asks for:
@@ -265,7 +276,8 @@ curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'
 - **After editing QML,** run `omarchy restart shell`.
 - **After editing the daemon,** run `./install.sh`.
 
-## Credits
+## License and credits
 
+- Sauron is [MIT licensed](LICENSE).
 - The camera scenes in the screenshots are rendered from [Poly Haven](https://polyhaven.com) panoramas (CC0).
 - Sauron is not affiliated with Ubiquiti.
