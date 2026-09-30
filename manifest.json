@@ -4,6 +4,7 @@
   "name": "Sauron",
   "version": "0.1.0",
   "author": "Daniel Neighman",
+  "license": "MIT",
   "description": "The Eye of Sauron: UniFi Protect detections, a live camera grid, and one-click live feeds in the Omarchy bar.",
   "kinds": ["service", "bar-widget"],
   "keepLoaded": true,
