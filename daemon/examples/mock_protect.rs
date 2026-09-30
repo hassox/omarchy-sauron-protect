@@ -30,13 +30,14 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, interval_at, sleep};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::handshake::server::{Callback, ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::handshake::server::{
+    Callback, ErrorResponse, Request, Response,
+};
 use tokio_tungstenite::tungstenite::http;
 
 const API_KEY: &str = "mock";
 const API: &str = "/proxy/protect/integration";
-const UNAUTHENTICATED: &str =
-    r#"{"error":"Failed to authenticate request using 'apiKey'","name":"UNAUTHENTICATED","type":"apiKey"}"#;
+const UNAUTHENTICATED: &str = r#"{"error":"Failed to authenticate request using 'apiKey'","name":"UNAUTHENTICATED","type":"apiKey"}"#;
 const MAX_HEAD: usize = 16 * 1024;
 const LOGIN_USER: &str = "sauron";
 const MFA_USER: &str = "mfa";
@@ -87,8 +88,20 @@ const CAMERAS: [CameraDef; 5] = [
         types: &["person", "animal"],
         hue: 144,
     },
-    CameraDef { id: "66d025b301ebc903e8000004", name: "Garage", model: "G3 Flex", types: &[], hue: 216 },
-    CameraDef { id: "66d025b301ebc903e8000005", name: "Side Gate", model: "G5 Flex", types: &[], hue: 288 },
+    CameraDef {
+        id: "66d025b301ebc903e8000004",
+        name: "Garage",
+        model: "G3 Flex",
+        types: &[],
+        hue: 216,
+    },
+    CameraDef {
+        id: "66d025b301ebc903e8000005",
+        name: "Side Gate",
+        model: "G5 Flex",
+        types: &[],
+        hue: 288,
+    },
 ];
 const FRONT_DOOR: usize = 0;
 /// Answers 400 to `highQuality=true` snapshots, like the G5 Pro (supportFullHdSnapshot false).
@@ -122,17 +135,36 @@ struct Mock {
 impl Mock {
     /// ffmpeg input arguments and filter for a camera's picture at `width`x`height`: its scene
     /// photo (still, looped at `rate`) when one exists, else a tinted, labelled test pattern.
-    fn picture(&self, def: &CameraDef, width: u32, height: u32, rate: u32, label: &str) -> (Vec<String>, String) {
-        let scene = self.scenes.as_ref().map(|dir| dir.join(format!("{}.jpg", def.name.to_lowercase().replace(' ', "-"))));
+    fn picture(
+        &self,
+        def: &CameraDef,
+        width: u32,
+        height: u32,
+        rate: u32,
+        label: &str,
+    ) -> (Vec<String>, String) {
+        let scene = self
+            .scenes
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.jpg", def.name.to_lowercase().replace(' ', "-"))));
         if let Some(scene) = scene.filter(|path| path.is_file()) {
-            let input = ["-loop", "1", "-framerate", &rate.to_string(), "-i"].map(String::from).into_iter();
-            let mut filter = format!("scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}");
+            let input = ["-loop", "1", "-framerate", &rate.to_string(), "-i"]
+                .map(String::from)
+                .into_iter();
+            let mut filter = format!(
+                "scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+            );
             if self.drawtext {
                 filter.push_str(
                     ",drawtext=text='%{localtime\\:%Y-%m-%d  %T}':fontcolor=white@0.9:fontsize=h/30:shadowcolor=black@0.8:shadowx=1:shadowy=1:x=w-tw-h/40:y=h-th-h/40",
                 );
             }
-            return (input.chain([scene.to_string_lossy().into_owned()]).collect(), filter);
+            return (
+                input
+                    .chain([scene.to_string_lossy().into_owned()])
+                    .collect(),
+                filter,
+            );
         }
         let input = ["-f", "lavfi", "-i"].map(String::from).into_iter();
         let filter = if self.drawtext {
@@ -143,11 +175,18 @@ impl Mock {
         } else {
             format!("hue=h={}", def.hue)
         };
-        (input.chain([format!("testsrc2=size={width}x{height}:rate={rate}")]).collect(), filter)
+        (
+            input
+                .chain([format!("testsrc2=size={width}x{height}:rate={rate}")])
+                .collect(),
+            filter,
+        )
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// xorshift64; good enough for picking cameras and ids.
@@ -171,17 +210,30 @@ impl Mock {
 
     fn new_uuid(&self) -> String {
         let (a, b) = (self.random(), self.random());
-        format!("{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}", a >> 32, a & 0xffff, b >> 52, (b >> 40) & 0xfff, b & 0xffff_ffff_ffff)
+        format!(
+            "{:08x}-{:04x}-4{:03x}-a{:03x}-{:012x}",
+            a >> 32,
+            a & 0xffff,
+            b >> 52,
+            (b >> 40) & 0xfff,
+            b & 0xffff_ffff_ffff
+        )
     }
 
     /// The encoder for a camera channel, started on first use and kept running for later viewers.
     fn livestream(self: &Arc<Self>, camera: usize, channel: u8) -> Arc<Livestream> {
-        let mut livestreams = self.livestreams.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut livestreams = self
+            .livestreams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         livestreams
             .entry((camera, channel))
             .or_insert_with(|| {
                 let stream = Arc::new(Livestream {
-                    cache: Mutex::new(Gop { init: Vec::new(), fragments: Vec::new() }),
+                    cache: Mutex::new(Gop {
+                        init: Vec::new(),
+                        fragments: Vec::new(),
+                    }),
                     live: broadcast::channel(256).0,
                     phase: watch::channel(Phase::Starting).0,
                 });
@@ -203,7 +255,9 @@ impl Mock {
 
     /// Adds an event from the websocket to the history, or applies an update to it.
     fn record(&self, item: &Value) {
-        let Some(id) = item["id"].as_str() else { return };
+        let Some(id) = item["id"].as_str() else {
+            return;
+        };
         let mut state = self.state();
         if let Some(event) = state.history.iter_mut().rev().find(|e| e["id"] == id) {
             for key in ["end", "smartDetectTypes"] {
@@ -213,10 +267,24 @@ impl Mock {
             }
             return;
         }
-        let (Some(kind), Some(start)) = (item["type"].as_str(), item["start"].as_u64()) else { return };
-        let types: Vec<&str> =
-            item["smartDetectTypes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        let event = history_event(id, kind, start, item["end"].as_u64(), item["device"].as_str(), &types, json!({}));
+        let (Some(kind), Some(start)) = (item["type"].as_str(), item["start"].as_u64()) else {
+            return;
+        };
+        let types: Vec<&str> = item["smartDetectTypes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let event = history_event(
+            id,
+            kind,
+            start,
+            item["end"].as_u64(),
+            item["device"].as_str(),
+            &types,
+            json!({}),
+        );
         insert_sorted(&mut state.history, event);
     }
 
@@ -250,7 +318,9 @@ impl Mock {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -269,7 +339,9 @@ async fn main() -> io::Result<()> {
             ("--scenes", _) if value.is_some() => scenes = value.map(std::path::PathBuf::from),
             ("--bind", _) if value.is_some() => bind = value.unwrap_or_default(),
             _ => {
-                eprintln!("usage: mock_protect [--port 7447] [--bind 127.0.0.1] [--interval 20] [--scenes DIR]");
+                eprintln!(
+                    "usage: mock_protect [--port 7447] [--bind 127.0.0.1] [--interval 20] [--scenes DIR]"
+                );
                 std::process::exit(2);
             }
         }
@@ -300,7 +372,10 @@ async fn main() -> io::Result<()> {
         if mock.drawtext { "on" } else { "off" }
     );
 
-    tokio::spawn(generate_events(mock.clone(), Duration::from_secs(interval_secs)));
+    tokio::spawn(generate_events(
+        mock.clone(),
+        Duration::from_secs(interval_secs),
+    ));
     tokio::spawn(toggle_side_gate(mock.clone()));
     loop {
         let (stream, _) = listener.accept().await?;
@@ -333,7 +408,10 @@ struct Head {
 
 impl Head {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     fn authorized(&self) -> bool {
@@ -352,7 +430,10 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<(Head, Vec<u8>, usize)>
             return Err(io::Error::other("request head too large"));
         }
         if stream.read_buf(&mut buf).await? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-request"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed mid-request",
+            ));
         }
     };
     let text = std::str::from_utf8(&buf[..head_len]).map_err(io::Error::other)?;
@@ -365,22 +446,41 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<(Head, Vec<u8>, usize)>
         .filter_map(|line| line.split_once(':'))
         .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
         .collect();
-    let head = Head { method: method.to_owned(), target: target.to_owned(), headers };
+    let head = Head {
+        method: method.to_owned(),
+        target: target.to_owned(),
+        headers,
+    };
     Ok((head, buf, head_len))
 }
 
 async fn serve(mock: &Arc<Mock>, mut stream: TcpStream) -> io::Result<()> {
     let (head, mut buf, head_len) = read_head(&mut stream).await?;
-    let url = reqwest::Url::parse(&format!("http://mock{}", head.target)).map_err(io::Error::other)?;
-    let is_upgrade = head.header("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    let url =
+        reqwest::Url::parse(&format!("http://mock{}", head.target)).map_err(io::Error::other)?;
+    let is_upgrade = head
+        .header("upgrade")
+        .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
     if is_upgrade && url.path() == LIVESTREAM_WS_PATH {
         // The URL's token is the only credential, and it works once.
-        let token = url.query_pairs().find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()).unwrap_or_default();
+        let token = url
+            .query_pairs()
+            .find(|(k, _)| k == "token")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
         let Some(target) = mock.state().livestream_tokens.remove(&token) else {
             eprintln!("mock: livestream websocket rejected: unknown token");
-            return respond(&mut stream, &json_reply(401, &json!({"error": "invalid token"}))).await;
+            return respond(
+                &mut stream,
+                &json_reply(401, &json!({"error": "invalid token"})),
+            )
+            .await;
         };
-        let replay = Rewind { prefix: buf, pos: 0, inner: stream };
+        let replay = Rewind {
+            prefix: buf,
+            pos: 0,
+            inner: stream,
+        };
         return livestream_socket(mock.clone(), replay, target).await;
     }
     if is_upgrade {
@@ -389,14 +489,24 @@ async fn serve(mock: &Arc<Mock>, mut stream: TcpStream) -> io::Result<()> {
             Some("/v1/subscribe/devices") => &mock.devices,
             _ => return respond(&mut stream, &not_found()).await,
         };
-        let replay = Rewind { prefix: buf, pos: 0, inner: stream };
+        let replay = Rewind {
+            prefix: buf,
+            pos: 0,
+            inner: stream,
+        };
         return websocket(replay, topic.subscribe(), url.path().to_owned()).await;
     }
 
-    let length: usize = head.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let length: usize = head
+        .header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     while buf.len() < head_len + length {
         if stream.read_buf(&mut buf).await? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-body"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed mid-body",
+            ));
         }
     }
     let body = &buf[head_len..head_len + length];
@@ -440,7 +550,12 @@ struct Reply {
 
 impl Reply {
     fn new(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
-        Self { status, content_type, body, headers: Vec::new() }
+        Self {
+            status,
+            content_type,
+            body,
+            headers: Vec::new(),
+        }
     }
 
     fn header(mut self, name: &'static str, value: String) -> Self {
@@ -458,10 +573,18 @@ fn not_found() -> Reply {
 }
 
 async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -> Reply {
-    let query = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
+    let query = |key: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+    };
     match (head.method.as_str(), url.path()) {
         ("POST", "/mock/trigger") => {
-            return trigger(mock, query("camera").as_deref(), query("kind").as_deref().unwrap_or("person"));
+            return trigger(
+                mock,
+                query("camera").as_deref(),
+                query("kind").as_deref().unwrap_or("person"),
+            );
         }
         ("POST", "/mock/livestream") => {
             let broken = query("fail").as_deref() == Some("true");
@@ -474,8 +597,12 @@ async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -
         }
         // UniFi OS hands out a CSRF token with its root page.
         ("GET", "/") => {
-            return Reply::new(200, "text/html", b"<!doctype html><title>UniFi OS</title>".to_vec())
-                .header("X-CSRF-Token", mock.new_uuid());
+            return Reply::new(
+                200,
+                "text/html",
+                b"<!doctype html><title>UniFi OS</title>".to_vec(),
+            )
+            .header("X-CSRF-Token", mock.new_uuid());
         }
         ("POST", "/api/auth/login") => return login(mock, body),
         ("GET", LIVESTREAM_PATH) => return livestream_endpoint(mock, head, &query),
@@ -483,52 +610,89 @@ async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -
         _ => {}
     }
     if head.method == "GET"
-        && let Some(id) = url.path().strip_prefix(EVENTS_PATH).and_then(|p| p.strip_prefix('/')?.strip_suffix("/thumbnail"))
+        && let Some(id) = url
+            .path()
+            .strip_prefix(EVENTS_PATH)
+            .and_then(|p| p.strip_prefix('/')?.strip_suffix("/thumbnail"))
     {
         return thumbnail_endpoint(mock, head, id).await;
     }
-    let Some(path) = url.path().strip_prefix(API) else { return not_found() };
+    let Some(path) = url.path().strip_prefix(API) else {
+        return not_found();
+    };
     if !head.authorized() {
         return Reply::new(401, "application/json", UNAUTHENTICATED.as_bytes().to_vec());
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (head.method.as_str(), segments.as_slice()) {
-        ("GET", ["v1", "meta", "info"]) => json_reply(200, &json!({"applicationVersion": "6.1.79"})),
-        ("GET", ["v1", "cameras"]) => {
-            json_reply(200, &Value::Array((0..CAMERAS.len()).map(|i| mock.camera_json(i)).collect()))
+        ("GET", ["v1", "meta", "info"]) => {
+            json_reply(200, &json!({"applicationVersion": "6.1.79"}))
         }
+        ("GET", ["v1", "cameras"]) => json_reply(
+            200,
+            &Value::Array((0..CAMERAS.len()).map(|i| mock.camera_json(i)).collect()),
+        ),
         ("GET", ["v1", "cameras", id]) => match camera_index(id) {
             Some(index) => json_reply(200, &mock.camera_json(index)),
             None => not_found(),
         },
         ("GET", ["v1", "cameras", id, "snapshot"]) => {
-            let Some(index) = camera_index(id) else { return not_found() };
+            let Some(index) = camera_index(id) else {
+                return not_found();
+            };
             if !mock.connected(index) {
-                return json_reply(503, &json!({"error": "The camera is offline or not reachable.", "name": "OFFLINE"}));
+                return json_reply(
+                    503,
+                    &json!({"error": "The camera is offline or not reachable.", "name": "OFFLINE"}),
+                );
             }
             let high_quality = query("highQuality").as_deref() == Some("true");
             if high_quality && index == DRIVEWAY {
-                return json_reply(400, &json!({"error": "Full HD snapshots are not supported", "name": "BAD_REQUEST"}));
+                return json_reply(
+                    400,
+                    &json!({"error": "Full HD snapshots are not supported", "name": "BAD_REQUEST"}),
+                );
             }
             match render_snapshot(mock, index, high_quality).await {
                 Ok(jpeg) => Reply::new(200, "image/jpeg", jpeg),
-                Err(err) => json_reply(500, &json!({"error": err.to_string(), "name": "API_ERROR"})),
+                Err(err) => {
+                    json_reply(500, &json!({"error": err.to_string(), "name": "API_ERROR"}))
+                }
             }
         }
         ("GET", ["v1", "cameras", id, "rtsps-stream"]) => {
-            let Some(index) = camera_index(id) else { return not_found() };
+            let Some(index) = camera_index(id) else {
+                return not_found();
+            };
             let state = mock.state();
-            let url = |q: &str| state.streams.contains(&(index, q.to_owned())).then(|| stream_url(index, q));
-            json_reply(200, &json!({"high": url("high"), "medium": url("medium"), "low": url("low"), "package": null}))
+            let url = |q: &str| {
+                state
+                    .streams
+                    .contains(&(index, q.to_owned()))
+                    .then(|| stream_url(index, q))
+            };
+            json_reply(
+                200,
+                &json!({"high": url("high"), "medium": url("medium"), "low": url("low"), "package": null}),
+            )
         }
         ("POST", ["v1", "cameras", id, "rtsps-stream"]) => {
-            let Some(index) = camera_index(id) else { return not_found() };
+            let Some(index) = camera_index(id) else {
+                return not_found();
+            };
             let qualities: Vec<String> = serde_json::from_slice::<Value>(body)
                 .ok()
                 .and_then(|v| serde_json::from_value(v["qualities"].clone()).ok())
                 .unwrap_or_default();
-            if qualities.is_empty() || !qualities.iter().all(|q| matches!(q.as_str(), "high" | "medium" | "low")) {
-                return json_reply(400, &json!({"error": "invalid qualities", "name": "BAD_REQUEST"}));
+            if qualities.is_empty()
+                || !qualities
+                    .iter()
+                    .all(|q| matches!(q.as_str(), "high" | "medium" | "low"))
+            {
+                return json_reply(
+                    400,
+                    &json!({"error": "invalid qualities", "name": "BAD_REQUEST"}),
+                );
             }
             let mut state = mock.state();
             let mut created = serde_json::Map::new();
@@ -543,25 +707,49 @@ async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -
 }
 
 fn camera_index(id_or_name: &str) -> Option<usize> {
-    CAMERAS.iter().position(|c| c.id == id_or_name || c.name.eq_ignore_ascii_case(id_or_name))
+    CAMERAS
+        .iter()
+        .position(|c| c.id == id_or_name || c.name.eq_ignore_ascii_case(id_or_name))
 }
 
 fn stream_url(index: usize, quality: &str) -> String {
-    format!("rtsp://127.0.0.1:8554/{}-{quality}?enableSrtp", CAMERAS[index].id)
+    format!(
+        "rtsp://127.0.0.1:8554/{}-{quality}?enableSrtp",
+        CAMERAS[index].id
+    )
 }
 
 async fn render_snapshot(mock: &Mock, index: usize, high_quality: bool) -> io::Result<Vec<u8>> {
-    let (width, height) = if high_quality { (1920, 1080) } else { (640, 360) };
+    let (width, height) = if high_quality {
+        (1920, 1080)
+    } else {
+        (640, 360)
+    };
     let (input, filter) = mock.picture(&CAMERAS[index], width, height, 1, "");
     let output = tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error"])
         .args(&input)
-        .args(["-frames:v", "1", "-vf", &filter, "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "pipe:1"])
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &filter,
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "5",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ])
         .stdin(Stdio::null())
         .output()
         .await?;
     if !output.status.success() || output.stdout.is_empty() {
-        return Err(io::Error::other(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+        return Err(io::Error::other(format!(
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     Ok(output.stdout)
 }
@@ -576,7 +764,11 @@ struct Rewind {
 }
 
 impl AsyncRead for Rewind {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.pos < self.prefix.len() {
             let n = buf.remaining().min(self.prefix.len() - self.pos);
             buf.put_slice(&self.prefix[self.pos..self.pos + n]);
@@ -588,7 +780,11 @@ impl AsyncRead for Rewind {
 }
 
 impl AsyncWrite for Rewind {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
@@ -606,17 +802,28 @@ struct RequireKey;
 
 impl Callback for RequireKey {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-        if request.headers().get("x-api-key").is_some_and(|k| k == API_KEY) {
+        if request
+            .headers()
+            .get("x-api-key")
+            .is_some_and(|k| k == API_KEY)
+        {
             return Ok(response);
         }
         let mut error = ErrorResponse::new(Some(UNAUTHENTICATED.to_owned()));
         *error.status_mut() = http::StatusCode::UNAUTHORIZED;
-        error.headers_mut().insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+        error.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
         Err(error)
     }
 }
 
-async fn websocket(stream: Rewind, mut frames: broadcast::Receiver<String>, path: String) -> io::Result<()> {
+async fn websocket(
+    stream: Rewind,
+    mut frames: broadcast::Receiver<String>,
+    path: String,
+) -> io::Result<()> {
     let mut ws = match tokio_tungstenite::accept_hdr_async(stream, RequireKey).await {
         Ok(ws) => ws,
         Err(err) => {
@@ -651,11 +858,19 @@ fn login(mock: &Mock, body: &[u8]) -> Reply {
     let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let username = request["username"].as_str().unwrap_or_default();
     let password = request["password"].as_str().unwrap_or_default();
-    let (token, csrf, user_id) = (format!("mock.{}.{}", mock.new_id(), mock.new_id()), mock.new_uuid(), mock.new_uuid());
+    let (token, csrf, user_id) = (
+        format!("mock.{}.{}", mock.new_id(), mock.new_id()),
+        mock.new_uuid(),
+        mock.new_uuid(),
+    );
 
     let mut state = mock.state();
     let now = Instant::now();
-    while state.login_failures.front().is_some_and(|at| now.duration_since(*at) > LOGIN_WINDOW) {
+    while state
+        .login_failures
+        .front()
+        .is_some_and(|at| now.duration_since(*at) > LOGIN_WINDOW)
+    {
         state.login_failures.pop_front();
     }
     if state.login_failures.len() >= LOGIN_FAILURES_ALLOWED {
@@ -682,9 +897,15 @@ fn login(mock: &Mock, body: &[u8]) -> Reply {
         );
     }
     state.sessions.insert(token.clone());
-    json_reply(200, &json!({"unique_id": user_id, "username": username, "isOwner": false, "deviceToken": ""}))
-        .header("Set-Cookie", format!("TOKEN={token}; path=/; samesite=strict; secure; httponly"))
-        .header("X-Updated-CSRF-Token", csrf)
+    json_reply(
+        200,
+        &json!({"unique_id": user_id, "username": username, "isOwner": false, "deviceToken": ""}),
+    )
+    .header(
+        "Set-Cookie",
+        format!("TOKEN={token}; path=/; samesite=strict; secure; httponly"),
+    )
+    .header("X-Updated-CSRF-Token", csrf)
 }
 
 struct LivestreamTarget {
@@ -702,31 +923,51 @@ fn livestream_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<
         return json_reply(401, &json!({"error": "Unauthorized"}));
     }
     if state.livestream_broken {
-        return json_reply(500, &json!({"error": "Livestream unavailable (mock failure)"}));
+        return json_reply(
+            500,
+            &json!({"error": "Livestream unavailable (mock failure)"}),
+        );
     }
-    let Some(camera) = query("camera").and_then(|id| CAMERAS.iter().position(|c| c.id == id)) else {
+    let Some(camera) = query("camera").and_then(|id| CAMERAS.iter().position(|c| c.id == id))
+    else {
         return json_reply(400, &json!({"error": "Invalid camera"}));
     };
     if !state.connected[camera] {
         return json_reply(503, &json!({"error": "Camera is not connected"}));
     }
-    let Some(channel) = query("channel").and_then(|c| c.parse::<u8>().ok()).filter(|c| *c <= 2) else {
+    let Some(channel) = query("channel")
+        .and_then(|c| c.parse::<u8>().ok())
+        .filter(|c| *c <= 2)
+    else {
         return json_reply(400, &json!({"error": "Invalid channel"}));
     };
     if query("type").as_deref() != Some("fmp4") {
         return json_reply(400, &json!({"error": "Only fmp4 is supported by the mock"}));
     }
-    let chunk_size = query("chunkSize").and_then(|c| c.parse().ok()).filter(|c| (256..=1 << 20).contains(c));
-    let target = LivestreamTarget { camera, channel, chunk_size: chunk_size.unwrap_or(4096) };
+    let chunk_size = query("chunkSize")
+        .and_then(|c| c.parse().ok())
+        .filter(|c| (256..=1 << 20).contains(c));
+    let target = LivestreamTarget {
+        camera,
+        channel,
+        chunk_size: chunk_size.unwrap_or(4096),
+    };
     state.livestream_tokens.insert(token.clone(), target);
-    let url = format!("ws://{LIVESTREAM_INTERNAL_HOST}:{}{LIVESTREAM_WS_PATH}?token={token}", mock.port);
+    let url = format!(
+        "ws://{LIVESTREAM_INTERNAL_HOST}:{}{LIVESTREAM_WS_PATH}?token={token}",
+        mock.port
+    );
     json_reply(200, &json!({ "url": url }))
 }
 
 /// The UniFi OS session from the request's `TOKEN` cookie.
 fn session_token(head: &Head) -> Option<&str> {
-    head.header("cookie")
-        .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|pair| pair.strip_prefix("TOKEN=")))
+    head.header("cookie").and_then(|cookies| {
+        cookies
+            .split(';')
+            .map(str::trim)
+            .find_map(|pair| pair.strip_prefix("TOKEN="))
+    })
 }
 
 // ---- event history ----------------------------------------------------------------------------
@@ -775,8 +1016,14 @@ fn seed_history(mock: &Mock) {
         let id = mock.new_uuid();
         let event = if n % 15 == 14 {
             let (kind, metadata) = match (n / 15) % 5 {
-                0 => ("access", json!({"ip": "192.0.2.10", "clientPlatform": "web", "user": {"text": "Mock Admin"}})),
-                1 => ("adminActivity", json!({"ip": "192.0.2.11", "action": "login", "user": {"text": "Mock Admin"}})),
+                0 => (
+                    "access",
+                    json!({"ip": "192.0.2.10", "clientPlatform": "web", "user": {"text": "Mock Admin"}}),
+                ),
+                1 => (
+                    "adminActivity",
+                    json!({"ip": "192.0.2.11", "action": "login", "user": {"text": "Mock Admin"}}),
+                ),
                 2 => ("userArrived", json!({"user": {"text": "Mock Resident"}})),
                 3 => ("userLeft", json!({"user": {"text": "Mock Resident"}})),
                 _ => ("deviceConnected", json!({"device": {"text": "Mock Chime"}})),
@@ -793,11 +1040,22 @@ fn seed_history(mock: &Mock) {
                 (9, _) if camera == FRONT_DOOR => ("ring", vec![]),
                 _ => ("motion", vec![]),
             };
-            history_event(&id, kind, start, Some(end), Some(CAMERAS[camera].id), &detected, json!({}))
+            history_event(
+                &id,
+                kind,
+                start,
+                Some(end),
+                Some(CAMERAS[camera].id),
+                &detected,
+                json!({}),
+            )
         };
         history.push(event);
     }
-    eprintln!("mock: history of {} events over the last {HISTORY_DAYS} days", history.len());
+    eprintln!(
+        "mock: history of {} events over the last {HISTORY_DAYS} days",
+        history.len()
+    );
     // Generated in start order.
     mock.state().history = history;
 }
@@ -816,11 +1074,17 @@ fn events_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<Stri
             &json!({"error": "`start` and `end` are both required unless a valid `limit` is passed (1-100)."}),
         );
     };
-    let limit = number("limit").map_or(HISTORY_PAGE_MAX, |limit| (limit as usize).min(HISTORY_PAGE_MAX));
+    let limit = number("limit").map_or(HISTORY_PAGE_MAX, |limit| {
+        (limit as usize).min(HISTORY_PAGE_MAX)
+    });
     let descending = query("orderDirection").is_some_and(|d| d.eq_ignore_ascii_case("desc"));
     let state = mock.state();
-    let from = state.history.partition_point(|e| e["start"].as_u64() < Some(start));
-    let to = state.history.partition_point(|e| e["start"].as_u64() <= Some(end));
+    let from = state
+        .history
+        .partition_point(|e| e["start"].as_u64() < Some(start));
+    let to = state
+        .history
+        .partition_point(|e| e["start"].as_u64() <= Some(end));
     let window = &state.history[from..to.max(from)];
     let page: Vec<Value> = if descending {
         window.iter().rev().take(limit).cloned().collect()
@@ -838,7 +1102,10 @@ async fn thumbnail_endpoint(mock: &Mock, head: &Head, id: &str) -> Reply {
     if !mock.logged_in(head) {
         return json_reply(401, &json!({"error": "Unauthorized"}));
     }
-    let pending = |end: &Value| end.as_u64().is_some_and(|end| now_ms() < end + THUMBNAIL_PENDING.as_millis() as u64);
+    let pending = |end: &Value| {
+        end.as_u64()
+            .is_some_and(|end| now_ms() < end + THUMBNAIL_PENDING.as_millis() as u64)
+    };
     let camera = mock
         .state()
         .history
@@ -846,7 +1113,11 @@ async fn thumbnail_endpoint(mock: &Mock, head: &Head, id: &str) -> Reply {
         .find(|e| e["id"] == id && !pending(&e["end"]))
         .and_then(|e| camera_index(e["camera"].as_str()?));
     let Some(camera) = camera else {
-        return Reply::new(404, "application/json", NOT_FOUND_RESOURCE.as_bytes().to_vec());
+        return Reply::new(
+            404,
+            "application/json",
+            NOT_FOUND_RESOURCE.as_bytes().to_vec(),
+        );
     };
     match render_snapshot(mock, camera, false).await {
         Ok(jpeg) => Reply::new(200, "image/jpeg", jpeg),
@@ -881,22 +1152,35 @@ struct Livestream {
 
 impl Livestream {
     fn cache(&self) -> std::sync::MutexGuard<'_, Gop> {
-        self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 async fn encode(mock: Arc<Mock>, camera: usize, channel: u8, stream: Arc<Livestream>) {
     if let Err(err) = encode_fmp4(&mock, camera, channel, &stream).await {
-        eprintln!("mock: livestream {} channel {channel}: {err}", CAMERAS[camera].name);
+        eprintln!(
+            "mock: livestream {} channel {channel}: {err}",
+            CAMERAS[camera].name
+        );
     }
-    mock.livestreams.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&(camera, channel));
+    mock.livestreams
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(camera, channel));
     stream.phase.send_replace(Phase::Ended);
     let _ = stream.live.send(None);
 }
 
 /// Runs ffmpeg in real time and splits its fragmented MP4 into the init segment and moof+mdat
 /// fragments, keeping the current GOP cached.
-async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestream) -> io::Result<()> {
+async fn encode_fmp4(
+    mock: &Mock,
+    camera: usize,
+    channel: u8,
+    stream: &Livestream,
+) -> io::Result<()> {
     let def = &CAMERAS[camera];
     let (width, height) = match channel {
         0 => (1280, 720),
@@ -907,21 +1191,41 @@ async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestrea
     let mut ffmpeg = tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-re"])
         .args(&input)
-        .args(["-vf", &filter, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"])
+        .args([
+            "-vf",
+            &filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+        ])
         .args(["-g", "30", "-pix_fmt", "yuv420p", "-f", "mp4"])
-        .args(["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "100000", "pipe:1"])
+        .args([
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "-frag_duration",
+            "100000",
+            "pipe:1",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    let mut stdout = ffmpeg.stdout.take().ok_or_else(|| io::Error::other("ffmpeg has no stdout"))?;
+    let mut stdout = ffmpeg
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("ffmpeg has no stdout"))?;
     eprintln!("mock: livestream {} channel {channel} encoding", def.name);
 
     let (mut buf, mut init, mut moof) = (Vec::with_capacity(1 << 20), Vec::new(), None::<Vec<u8>>);
     loop {
         let mut offset = 0;
         while let Some((kind, size)) = box_header(&buf[offset..]) {
-            let Some(item) = buf.get(offset..offset + size) else { break };
+            let Some(item) = buf.get(offset..offset + size) else {
+                break;
+            };
             match &kind {
                 b"ftyp" => init.extend_from_slice(item),
                 b"moov" => {
@@ -933,7 +1237,10 @@ async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestrea
                 b"mdat" => {
                     if let Some(moof) = moof.take() {
                         let keyframe = first_sample_is_sync(&moof);
-                        let fragment = Arc::new(Fragment { moof, mdat: item.to_vec() });
+                        let fragment = Arc::new(Fragment {
+                            moof,
+                            mdat: item.to_vec(),
+                        });
                         let mut cache = stream.cache();
                         if keyframe {
                             cache.fragments.clear();
@@ -962,7 +1269,11 @@ async fn encode_fmp4(mock: &Mock, camera: usize, channel: u8, stream: &Livestrea
 fn box_header(data: &[u8]) -> Option<([u8; 4], usize)> {
     let size = u32::from_be_bytes(data.get(0..4)?.try_into().ok()?) as usize;
     let kind: [u8; 4] = data.get(4..8)?.try_into().ok()?;
-    let size = if size == 1 { u64::from_be_bytes(data.get(8..16)?.try_into().ok()?) as usize } else { size };
+    let size = if size == 1 {
+        u64::from_be_bytes(data.get(8..16)?.try_into().ok()?) as usize
+    } else {
+        size
+    };
     (size >= 8).then_some((kind, size))
 }
 
@@ -981,9 +1292,14 @@ fn child<'a>(mut data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
 /// Whether a fragment starts on a keyframe: the first sample's `sample_is_non_sync_sample` flag,
 /// from trun (first-sample or per-sample flags) or the tfhd default.
 fn first_sample_is_sync(moof: &[u8]) -> bool {
-    let read = |data: &[u8], at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let read = |data: &[u8], at: usize| {
+        data.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
     let is_sync = |flags: u32| flags & 0x0001_0000 == 0;
-    let Some(traf) = moof.get(8..).and_then(|boxes| child(boxes, b"traf")) else { return false };
+    let Some(traf) = moof.get(8..).and_then(|boxes| child(boxes, b"traf")) else {
+        return false;
+    };
     if let Some(trun) = child(traf, b"trun") {
         let flags = read(trun, 0).unwrap_or(0) & 0x00ff_ffff;
         let mut at = 8 + if flags & 0x1 != 0 { 4 } else { 0 };
@@ -995,14 +1311,20 @@ fn first_sample_is_sync(moof: &[u8]) -> bool {
             return read(trun, at).is_some_and(is_sync);
         }
     }
-    let Some(tfhd) = child(traf, b"tfhd") else { return false };
+    let Some(tfhd) = child(traf, b"tfhd") else {
+        return false;
+    };
     let flags = read(tfhd, 0).unwrap_or(0) & 0x00ff_ffff;
     if flags & 0x20 == 0 {
         return false;
     }
     let at = 8
         + if flags & 0x1 != 0 { 8 } else { 0 }
-        + [0x2, 0x8, 0x10].iter().filter(|bit| flags & *bit != 0).count() * 4;
+        + [0x2, 0x8, 0x10]
+            .iter()
+            .filter(|bit| flags & *bit != 0)
+            .count()
+            * 4;
     read(tfhd, at).is_some_and(is_sync)
 }
 
@@ -1037,30 +1359,50 @@ fn push_fragment(out: &mut Vec<u8>, fragment: &Fragment, chunk_size: usize) {
 
 /// Sends `out` as binary messages whose boundaries deliberately ignore frame boundaries, so
 /// clients must reassemble frames across messages.
-async fn flush<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, out: &mut Vec<u8>, chunk_size: usize) -> io::Result<()>
+async fn flush<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    out: &mut Vec<u8>,
+    chunk_size: usize,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     for piece in out.chunks(chunk_size + 1000) {
-        ws.send(Message::binary(piece.to_vec())).await.map_err(io::Error::other)?;
+        ws.send(Message::binary(piece.to_vec()))
+            .await
+            .map_err(io::Error::other)?;
     }
     out.clear();
     Ok(())
 }
 
 /// A livestream viewer: codec string, init segment and the cached GOP at once, then live fragments.
-async fn livestream_socket(mock: Arc<Mock>, stream: Rewind, target: LivestreamTarget) -> io::Result<()> {
-    let mut ws = tokio_tungstenite::accept_async(stream).await.map_err(io::Error::other)?;
+async fn livestream_socket(
+    mock: Arc<Mock>,
+    stream: Rewind,
+    target: LivestreamTarget,
+) -> io::Result<()> {
+    let mut ws = tokio_tungstenite::accept_async(stream)
+        .await
+        .map_err(io::Error::other)?;
     let name = CAMERAS[target.camera].name;
     eprintln!("mock: livestream {name} channel {} open", target.channel);
     let source = mock.livestream(target.camera, target.channel);
     let mut phase = source.phase.subscribe();
-    if !phase.wait_for(|p| *p != Phase::Starting).await.is_ok_and(|p| *p == Phase::Ready) {
+    if !phase
+        .wait_for(|p| *p != Phase::Starting)
+        .await
+        .is_ok_and(|p| *p == Phase::Ready)
+    {
         return ws.close(None).await.map_err(io::Error::other);
     }
     let (init, cached, mut live) = {
         let cache = source.cache();
-        (cache.init.clone(), cache.fragments.clone(), source.live.subscribe())
+        (
+            cache.init.clone(),
+            cache.fragments.clone(),
+            source.live.subscribe(),
+        )
     };
     let mut out = Vec::with_capacity(init.len() + 64 * 1024);
     push_frame(&mut out, frame::CODEC, b"avc1.64001f");
@@ -1102,8 +1444,9 @@ async fn generate_events(mock: Arc<Mock>, every: Duration) {
     loop {
         cycle += 1;
         ticks.tick().await;
-        let candidates: Vec<usize> =
-            (0..CAMERAS.len()).filter(|&i| mock.connected(i) && !CAMERAS[i].types.is_empty()).collect();
+        let candidates: Vec<usize> = (0..CAMERAS.len())
+            .filter(|&i| mock.connected(i) && !CAMERAS[i].types.is_empty())
+            .collect();
         if let Some(camera) = mock.pick(&candidates)
             && let Some(kind) = mock.pick(CAMERAS[camera].types)
         {
@@ -1113,7 +1456,13 @@ async fn generate_events(mock: Arc<Mock>, every: Duration) {
             package_drop(&mock, FRONT_DOOR);
         }
         if cycle.is_multiple_of(4) && mock.connected(FRONT_DOOR) {
-            tokio::spawn(simple_event(mock.clone(), FRONT_DOOR, "ring", None, Duration::from_secs(2)));
+            tokio::spawn(simple_event(
+                mock.clone(),
+                FRONT_DOOR,
+                "ring",
+                None,
+                Duration::from_secs(2),
+            ));
         }
     }
 }
@@ -1138,7 +1487,9 @@ async fn smart_detection(mock: Arc<Mock>, camera: usize, kind: &'static str) {
         }}));
     }
     sleep(Duration::from_secs(6)).await;
-    mock.publish_event(json!({"type": "update", "item": {"id": id, "modelKey": "event", "end": now_ms()}}));
+    mock.publish_event(
+        json!({"type": "update", "item": {"id": id, "modelKey": "event", "end": now_ms()}}),
+    );
 }
 
 /// A package detection arrives as one closed `update` with no preceding `add`.
@@ -1167,32 +1518,61 @@ async fn simple_event(
     }
     mock.publish_event(json!({"type": "add", "item": item}));
     sleep(duration).await;
-    mock.publish_event(json!({"type": "update", "item": {"id": id, "modelKey": "event", "end": now_ms()}}));
+    mock.publish_event(
+        json!({"type": "update", "item": {"id": id, "modelKey": "event", "end": now_ms()}}),
+    );
 }
 
 fn trigger(mock: &Arc<Mock>, camera: Option<&str>, kind: &str) -> Reply {
     let Some(camera) = camera.and_then(camera_index) else {
-        return json_reply(404, &json!({"error": "unknown camera", "name": "NOT_FOUND"}));
+        return json_reply(
+            404,
+            &json!({"error": "unknown camera", "name": "NOT_FOUND"}),
+        );
     };
     let (event_type, types, duration) = match kind {
         "package" => {
             package_drop(mock, camera);
-            return json_reply(200, &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}));
+            return json_reply(
+                200,
+                &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}),
+            );
         }
         "ring" => ("ring", None, Duration::from_secs(2)),
         "motion" => ("motion", None, Duration::from_secs(4)),
-        "audio" => ("smartAudioDetect", Some(&["alrmSmoke"][..]), Duration::from_secs(3)),
+        "audio" => (
+            "smartAudioDetect",
+            Some(&["alrmSmoke"][..]),
+            Duration::from_secs(3),
+        ),
         _ => {
-            let Some(kind) = ["person", "vehicle", "animal", "face", "licensePlate"].into_iter().find(|k| *k == kind)
+            let Some(kind) = ["person", "vehicle", "animal", "face", "licensePlate"]
+                .into_iter()
+                .find(|k| *k == kind)
             else {
-                return json_reply(400, &json!({"error": format!("unknown kind {kind}"), "name": "BAD_REQUEST"}));
+                return json_reply(
+                    400,
+                    &json!({"error": format!("unknown kind {kind}"), "name": "BAD_REQUEST"}),
+                );
             };
             tokio::spawn(smart_detection(mock.clone(), camera, kind));
-            return json_reply(200, &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}));
+            return json_reply(
+                200,
+                &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}),
+            );
         }
     };
-    tokio::spawn(simple_event(mock.clone(), camera, event_type, types, duration));
-    json_reply(200, &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}))
+    tokio::spawn(simple_event(
+        mock.clone(),
+        camera,
+        event_type,
+        types,
+        duration,
+    ));
+    json_reply(
+        200,
+        &json!({"ok": true, "camera": CAMERAS[camera].name, "kind": kind}),
+    )
 }
 
 async fn toggle_side_gate(mock: Arc<Mock>) {

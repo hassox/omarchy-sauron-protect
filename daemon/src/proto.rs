@@ -27,7 +27,7 @@ pub struct CameraOut<'a> {
     pub seq: u64,
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     Start,
@@ -116,7 +116,10 @@ pub struct Out {
 
 impl Out {
     pub fn new() -> Self {
-        Self { stdout: tokio::io::stdout(), line: Vec::with_capacity(1024) }
+        Self {
+            stdout: tokio::io::stdout(),
+            line: Vec::with_capacity(1024),
+        }
     }
 
     pub async fn send(&mut self, msg: &Msg<'_>) -> Result<()> {

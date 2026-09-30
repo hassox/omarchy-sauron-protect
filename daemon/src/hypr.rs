@@ -36,7 +36,11 @@ pub async fn clients() -> Result<Vec<Client>> {
 /// Focuses the window matching a Hyprland window selector such as `pid:123` or `address:0x…`
 /// (Lua dispatcher on Hyprland ≥ 0.55, legacy syntax otherwise).
 pub async fn focus(selector: &str) -> Result<()> {
-    let reply = hyprctl(&["dispatch", &format!("hl.dsp.focus({{ window = \"{selector}\" }})")]).await?;
+    let reply = hyprctl(&[
+        "dispatch",
+        &format!("hl.dsp.focus({{ window = \"{selector}\" }})"),
+    ])
+    .await?;
     if reply == "ok" {
         return Ok(());
     }
@@ -55,7 +59,10 @@ pub async fn focus_when_mapped(pid: u32) -> Result<()> {
             return focus(&format!("pid:{pid}")).await;
         }
         if Instant::now() >= deadline {
-            bail!("no window appeared for pid {pid} within {}s", MAP_TIMEOUT.as_secs());
+            bail!(
+                "no window appeared for pid {pid} within {}s",
+                MAP_TIMEOUT.as_secs()
+            );
         }
         sleep(MAP_POLL).await;
     }

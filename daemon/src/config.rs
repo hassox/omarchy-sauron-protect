@@ -11,7 +11,13 @@ use tokio::io::AsyncWriteExt;
 use crate::protect;
 use crate::tls::Fingerprint;
 
-const DEFAULT_PLAYER: [&str; 5] = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-window=immediate"];
+const DEFAULT_PLAYER: [&str; 5] = [
+    "mpv",
+    "--profile=low-latency",
+    "--untimed",
+    "--no-cache",
+    "--force-window=immediate",
+];
 
 /// Validated configuration with the API key already resolved.
 #[derive(Clone)]
@@ -83,7 +89,9 @@ impl fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn config_path() -> PathBuf {
@@ -91,7 +99,11 @@ pub fn config_path() -> PathBuf {
         return path;
     }
     env_path("XDG_CONFIG_HOME")
-        .unwrap_or_else(|| env_path("HOME").unwrap_or_else(|| PathBuf::from("/")).join(".config"))
+        .unwrap_or_else(|| {
+            env_path("HOME")
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".config")
+        })
         .join("sauron/config.toml")
 }
 
@@ -109,7 +121,9 @@ pub async fn read_settings(path: &Path) -> Result<Option<Settings>, LoadError> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(LoadError::Invalid(format!("cannot read the file: {err}"))),
     };
-    toml::from_str(&text).map(Some).map_err(|err| LoadError::Invalid(one_line(&err, &text)))
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|err| LoadError::Invalid(one_line(&err, &text)))
 }
 
 /// "line 3: invalid string" instead of toml's multi-line snippet.
@@ -117,7 +131,11 @@ fn one_line(err: &toml::de::Error, text: &str) -> String {
     let message = err.message().trim().replace('\n', " ");
     match err.span() {
         Some(span) => {
-            let line = text.as_bytes()[..span.start.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1;
+            let line = text.as_bytes()[..span.start.min(text.len())]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count()
+                + 1;
             format!("line {line}: {message}")
         }
         None => message,
@@ -126,7 +144,11 @@ fn one_line(err: &toml::de::Error, text: &str) -> String {
 
 /// Loads and validates the config.
 pub async fn load(path: &Path) -> Result<Config, LoadError> {
-    read_settings(path).await?.ok_or(LoadError::NotSetUp)?.validate().await
+    read_settings(path)
+        .await?
+        .ok_or(LoadError::NotSetUp)?
+        .validate()
+        .await
 }
 
 impl Settings {
@@ -137,8 +159,12 @@ impl Settings {
         if host.is_empty() {
             return invalid("`host` is empty".into());
         }
-        let fallback_hosts: Vec<String> =
-            self.fallback_hosts.iter().map(|a| address(a)).filter(|a| !a.is_empty()).collect();
+        let fallback_hosts: Vec<String> = self
+            .fallback_hosts
+            .iter()
+            .map(|a| address(a))
+            .filter(|a| !a.is_empty())
+            .collect();
         for candidate in std::iter::once(&host).chain(&fallback_hosts) {
             if let Err(err) = protect::base_url(candidate) {
                 return invalid(format!("{err:#}"));
@@ -148,11 +174,18 @@ impl Settings {
             "" => None,
             pin => match Fingerprint::parse(pin) {
                 Some(pin) => Some(pin),
-                None => return invalid("`cert_sha256` must be a SHA-256 fingerprint (64 hex digits)".into()),
+                None => {
+                    return invalid(
+                        "`cert_sha256` must be a SHA-256 fingerprint (64 hex digits)".into(),
+                    );
+                }
             },
         };
         if !matches!(self.live_quality.as_str(), "high" | "medium" | "low") {
-            return invalid(format!("`live_quality` must be high, medium or low, not {:?}", self.live_quality));
+            return invalid(format!(
+                "`live_quality` must be high, medium or low, not {:?}",
+                self.live_quality
+            ));
         }
         if self.player.first().is_none_or(|p| p.is_empty()) {
             return invalid("`player` must be a non-empty list".into());
@@ -160,9 +193,9 @@ impl Settings {
         let api_key = match (self.api_key.trim(), self.api_key_command.trim()) {
             ("", "") => return Err(LoadError::NotSetUp),
             (key, "") => key.to_owned(),
-            ("", command) => {
-                run_key_command(command).await.map_err(|err| LoadError::Invalid(format!("{err:#}")))?
-            }
+            ("", command) => run_key_command(command)
+                .await
+                .map_err(|err| LoadError::Invalid(format!("{err:#}")))?,
             _ => return invalid("set only one of `api_key` and `api_key_command`".into()),
         };
         let event_log = match self.event_log.trim() {
@@ -171,12 +204,18 @@ impl Settings {
                 let path = match path.strip_prefix("~/") {
                     Some(rest) => match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
                         Some(home) => PathBuf::from(home).join(rest),
-                        None => return invalid("`event_log` starts with ~/ but HOME is not set".into()),
+                        None => {
+                            return invalid(
+                                "`event_log` starts with ~/ but HOME is not set".into(),
+                            );
+                        }
                     },
                     None => PathBuf::from(path),
                 };
                 if !path.is_absolute() {
-                    return invalid(format!("`event_log` must be an absolute path or start with ~/, not {path:?}"));
+                    return invalid(format!(
+                        "`event_log` must be an absolute path or start with ~/, not {path:?}"
+                    ));
                 }
                 Some(path)
             }
@@ -211,9 +250,13 @@ async fn run_key_command(command: &str) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         let separator = if stderr.is_empty() { "" } else { ": " };
-        anyhow::bail!("`api_key_command` failed ({}){separator}{stderr}", output.status);
+        anyhow::bail!(
+            "`api_key_command` failed ({}){separator}{stderr}",
+            output.status
+        );
     }
-    let key = String::from_utf8(output.stdout).context("`api_key_command` printed non-UTF-8 output")?;
+    let key =
+        String::from_utf8(output.stdout).context("`api_key_command` printed non-UTF-8 output")?;
     let key = key.trim();
     if key.is_empty() {
         anyhow::bail!("`api_key_command` printed nothing");
@@ -224,9 +267,20 @@ async fn run_key_command(command: &str) -> Result<String> {
 /// The commented config file with `settings` filled in.
 fn render(settings: &Settings) -> String {
     let string = |s: &str| toml::Value::String(s.to_owned()).to_string();
-    let array = |items: &[String]| toml::Value::Array(items.iter().map(|s| toml::Value::String(s.clone())).collect());
-    let fallback_hosts: Vec<String> =
-        settings.fallback_hosts.iter().map(|a| address(a)).filter(|a| !a.is_empty()).collect();
+    let array = |items: &[String]| {
+        toml::Value::Array(
+            items
+                .iter()
+                .map(|s| toml::Value::String(s.clone()))
+                .collect(),
+        )
+    };
+    let fallback_hosts: Vec<String> = settings
+        .fallback_hosts
+        .iter()
+        .map(|a| address(a))
+        .filter(|a| !a.is_empty())
+        .collect();
     let cert_sha256 = match Fingerprint::parse(&settings.cert_sha256) {
         Some(pin) => pin.to_string(),
         None => settings.cert_sha256.trim().to_owned(),
@@ -289,12 +343,19 @@ pub async fn save(path: &Path, settings: &Settings) -> Result<()> {
     file.write_all(render(settings).as_bytes()).await?;
     file.sync_all().await?;
     drop(file);
-    tokio::fs::rename(&tmp, path).await.with_context(|| format!("cannot write {}", path.display()))
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// The IPv4 default gateway from `/proc/net/route`, if any.
 pub async fn default_gateway() -> Option<Ipv4Addr> {
-    let table = tokio::fs::read_to_string("/proc/net/route").await.ok()?;
+    gateway_from_routes(&tokio::fs::read_to_string("/proc/net/route").await.ok()?)
+}
+
+/// The gateway of the first default route that has one, from a `/proc/net/route` table
+/// (little-endian hex fields).
+fn gateway_from_routes(table: &str) -> Option<Ipv4Addr> {
     table.lines().skip(1).find_map(|line| {
         let mut fields = line.split_whitespace();
         let (_iface, destination, gateway) = (fields.next()?, fields.next()?, fields.next()?);
@@ -304,4 +365,300 @@ pub async fn default_gateway() -> Option<Ipv4Addr> {
         let gateway = u32::from_str_radix(gateway, 16).ok().filter(|&g| g != 0)?;
         Some(Ipv4Addr::from(gateway.to_le_bytes()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PIN: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn settings() -> Settings {
+        Settings {
+            host: "192.0.2.10".into(),
+            api_key: "test-key".into(),
+            ..Settings::default()
+        }
+    }
+
+    async fn invalid(settings: Settings) -> String {
+        match settings.validate().await {
+            Err(LoadError::Invalid(message)) => message,
+            Err(LoadError::NotSetUp) => panic!("expected Invalid, got NotSetUp"),
+            Ok(_) => panic!("expected Invalid, got a config"),
+        }
+    }
+
+    type Fields = (
+        String,
+        Vec<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        String,
+    );
+
+    fn fields(s: &Settings) -> Fields {
+        (
+            s.host.clone(),
+            s.fallback_hosts.clone(),
+            s.cert_sha256.clone(),
+            s.api_key.clone(),
+            s.api_key_command.clone(),
+            s.username.clone(),
+            s.live_quality.clone(),
+            s.player.clone(),
+            s.event_log.clone(),
+        )
+    }
+
+    fn parse(text: &str) -> Settings {
+        toml::from_str(text).unwrap_or_else(|err| panic!("{err}\n{text}"))
+    }
+
+    #[tokio::test]
+    async fn validate_normalizes_addresses_pin_and_key() {
+        let settings = Settings {
+            host: " https://192.0.2.10:8443/ ".into(),
+            fallback_hosts: vec!["".into(), " 198.51.100.7/ ".into(), "  ".into()],
+            cert_sha256: format!(" {PIN} "),
+            api_key: "  test-key \n".into(),
+            username: " viewer ".into(),
+            event_log: " /var/tmp/sauron events.jsonl ".into(),
+            ..Settings::default()
+        };
+        let Ok(config) = settings.validate().await else {
+            panic!("rejected")
+        };
+        assert_eq!(config.host, "https://192.0.2.10:8443");
+        assert_eq!(config.fallback_hosts, ["198.51.100.7"]);
+        assert_eq!(config.cert_sha256, Fingerprint::parse(PIN));
+        assert_eq!(config.api_key, "test-key");
+        assert_eq!(config.username, "viewer");
+        assert_eq!(
+            config.event_log,
+            Some(PathBuf::from("/var/tmp/sauron events.jsonl"))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_host_is_reported_first() {
+        let settings = Settings {
+            host: " / ".into(),
+            live_quality: "ultra".into(),
+            ..Settings::default()
+        };
+        assert_eq!(invalid(settings).await, "`host` is empty");
+    }
+
+    #[tokio::test]
+    async fn bad_values_are_errors_even_without_a_key() {
+        let no_key = || Settings {
+            api_key: String::new(),
+            ..settings()
+        };
+        let cases = [
+            (
+                Settings {
+                    cert_sha256: "AB:CD".into(),
+                    ..no_key()
+                },
+                "`cert_sha256`",
+            ),
+            (
+                Settings {
+                    live_quality: "ultra".into(),
+                    ..no_key()
+                },
+                "`live_quality`",
+            ),
+            (
+                Settings {
+                    player: Vec::new(),
+                    ..no_key()
+                },
+                "`player`",
+            ),
+            (
+                Settings {
+                    player: vec![String::new(), "--flag".into()],
+                    ..no_key()
+                },
+                "`player`",
+            ),
+            (
+                Settings {
+                    fallback_hosts: vec!["ftp://198.51.100.7".into()],
+                    ..no_key()
+                },
+                "http://",
+            ),
+            (
+                Settings {
+                    host: "ftp://192.0.2.10".into(),
+                    ..no_key()
+                },
+                "http://",
+            ),
+        ];
+        for (settings, needle) in cases {
+            let message = invalid(settings).await;
+            assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exactly_one_key_source_is_required() {
+        let neither = Settings {
+            api_key: "  ".into(),
+            api_key_command: " ".into(),
+            ..settings()
+        };
+        assert!(matches!(neither.validate().await, Err(LoadError::NotSetUp)));
+        let both = Settings {
+            api_key_command: "printf other".into(),
+            ..settings()
+        };
+        assert!(invalid(both).await.contains("only one of"));
+    }
+
+    #[tokio::test]
+    async fn key_command_output_is_trimmed_and_failures_reported() {
+        let command = |command: &str| Settings {
+            api_key: String::new(),
+            api_key_command: command.into(),
+            ..settings()
+        };
+        let Ok(config) = command("printf '  cmd-key\\n'").validate().await else {
+            panic!("rejected")
+        };
+        assert_eq!(config.api_key, "cmd-key");
+
+        let message = invalid(command("echo locked >&2; exit 3")).await;
+        assert!(
+            message.contains("failed") && message.contains("locked"),
+            "{message:?}"
+        );
+        assert!(invalid(command("true")).await.contains("printed nothing"));
+    }
+
+    #[tokio::test]
+    async fn event_log_is_absolute_or_under_home() {
+        let event_log = |path: &str| Settings {
+            event_log: path.into(),
+            ..settings()
+        };
+        let message = invalid(event_log("logs/events.jsonl")).await;
+        assert!(message.contains("absolute path"), "{message:?}");
+        assert!(
+            invalid(event_log("~alice/events.jsonl"))
+                .await
+                .contains("absolute path")
+        );
+
+        let Ok(off) = event_log("  ").validate().await else {
+            panic!("rejected")
+        };
+        assert_eq!(off.event_log, None);
+
+        // Whatever HOME is here: `~/` expands to it, and without it the path is an error.
+        let home = event_log("~/sauron/events.jsonl").validate().await;
+        match (
+            std::env::var_os("HOME").filter(|home| !home.is_empty()),
+            home,
+        ) {
+            (Some(home), Ok(config)) => {
+                assert_eq!(
+                    config.event_log,
+                    Some(PathBuf::from(home).join("sauron/events.jsonl"))
+                )
+            }
+            (None, Err(LoadError::Invalid(message))) => {
+                assert!(message.contains("HOME"), "{message:?}")
+            }
+            (home, result) => panic!("HOME {home:?} gave {:?}", result.err()),
+        }
+    }
+
+    #[test]
+    fn render_round_trips_through_the_parser() {
+        let settings = Settings {
+            host: "unifi.example".into(),
+            fallback_hosts: vec!["198.51.100.7".into(), "https://unifi.example:8443".into()],
+            cert_sha256: Fingerprint::parse(PIN).unwrap().to_string(),
+            api_key: r#"k"e\y#1 ünï"#.into(),
+            api_key_command: r#"secret-tool lookup service "sauron" # not a comment"#.into(),
+            username: "viewer".into(),
+            live_quality: "low".into(),
+            player: vec![
+                "mpv".into(),
+                "--title=\"x\"".into(),
+                "--geometry=50%".into(),
+            ],
+            event_log: "~/.local/state/sauron/events.jsonl".into(),
+        };
+        assert_eq!(fields(&parse(&render(&settings))), fields(&settings));
+
+        let defaults = Settings::default();
+        assert_eq!(fields(&parse(&render(&defaults))), fields(&defaults));
+    }
+
+    #[test]
+    fn render_writes_canonical_address_and_pin() {
+        let settings = Settings {
+            host: " 192.0.2.10/ ".into(),
+            fallback_hosts: vec![" ".into(), "198.51.100.7/".into()],
+            cert_sha256: PIN.into(),
+            ..settings()
+        };
+        let parsed = parse(&render(&settings));
+        assert_eq!(parsed.host, "192.0.2.10");
+        assert_eq!(parsed.fallback_hosts, ["198.51.100.7"]);
+        assert_eq!(
+            parsed.cert_sha256,
+            Fingerprint::parse(PIN).unwrap().to_string()
+        );
+    }
+
+    #[test]
+    fn old_verify_tls_key_still_parses() {
+        let parsed = parse("host = \"192.0.2.10\"\nverify_tls = false\napi_key = \"k\"\n");
+        assert_eq!(
+            (parsed.host.as_str(), parsed.api_key.as_str()),
+            ("192.0.2.10", "k")
+        );
+        assert_eq!(parsed.live_quality, "high");
+    }
+
+    #[test]
+    fn parse_errors_name_the_line_on_one_line() {
+        let text = "host = \"192.0.2.10\"\napi_key = \"k\"\nlive_quality = high\n";
+        let err = toml::from_str::<Settings>(text).err().unwrap();
+        let message = one_line(&err, text);
+        assert!(message.starts_with("line 3: "), "{message:?}");
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn default_gateway_is_the_first_default_route_with_a_gateway() {
+        let header =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+        let table = format!(
+            "{header}\
+             wg0\t00000000\t00000000\t0001\t0\t0\t50\t00000000\t0\t0\t0\n\
+             wlan0\t0000A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n\
+             wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+             eth0\t00000000\t0101A8C0\t0003\t0\t0\t700\t00000000\t0\t0\t0\n"
+        );
+        assert_eq!(
+            gateway_from_routes(&table),
+            Some(Ipv4Addr::new(192, 168, 0, 1))
+        );
+        let no_default =
+            format!("{header}wlan0\t0000A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n");
+        assert_eq!(gateway_from_routes(&no_default), None);
+    }
 }

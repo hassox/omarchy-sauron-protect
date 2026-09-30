@@ -11,7 +11,14 @@ use tokio::process::Command;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn attributes<'a>(console: &'a str, username: &'a str) -> [&'a str; 6] {
-    ["application", "sauron", "host", console, "username", username]
+    [
+        "application",
+        "sauron",
+        "host",
+        console,
+        "username",
+        username,
+    ]
 }
 
 /// The stored password, or `None` if the keyring is unavailable or has no entry.
@@ -41,13 +48,19 @@ pub async fn store(console: &str, username: &str, password: &str) -> Result<()> 
         .spawn()
         .context("cannot run secret-tool")?;
     let mut stdin = child.stdin.take().context("secret-tool has no stdin")?;
-    stdin.write_all(password.as_bytes()).await.context("cannot pass the password to secret-tool")?;
+    stdin
+        .write_all(password.as_bytes())
+        .await
+        .context("cannot pass the password to secret-tool")?;
     drop(stdin);
     let output = tokio::time::timeout(TIMEOUT, child.wait_with_output())
         .await
         .context("secret-tool timed out (is the keyring unlocked?)")??;
     if !output.status.success() {
-        bail!("secret-tool store failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!(
+            "secret-tool store failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
