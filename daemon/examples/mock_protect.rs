@@ -1,5 +1,5 @@
 //! Mock UniFi Protect console for end-to-end testing without cameras: the Integration API, the
-//! UniFi OS login and Protect's private livestream.
+//! UniFi OS login and Protect's private API (livestream, event history, event thumbnails).
 //!
 //! `cargo run --example mock_protect -- [--port 7447] [--bind 127.0.0.1] [--interval 20] [--scenes DIR]`,
 //! then point sauron at `host = "http://127.0.0.1:7447"` with `api_key = "mock"`; the UniFi OS user is `sauron` with
@@ -7,6 +7,11 @@
 //! `curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'` fires an event;
 //! `POST /mock/livestream?fail=true|false` breaks or repairs the livestream endpoint;
 //! `POST /mock/expire-sessions` logs every UniFi OS session out.
+//! The event history starts with eight days of made-up events (camera and other types) and records
+//! every event the mock fires. `GET /proxy/protect/api/events` pages it like Protect 7.2 does
+//! (start in `[start, end]`, inclusive), but at most `HISTORY_PAGE_MAX` per request so clients must
+//! page; `GET /proxy/protect/api/events/<id>/thumbnail` renders the camera's picture for a camera
+//! event (404 briefly after it ends, as Protect does) and answers 404 otherwise.
 //! `--scenes DIR` shows `DIR/<camera-name>.jpg` (e.g. `front-door.jpg`) instead of a test pattern,
 //! with a camera-style clock in the corner.
 
@@ -44,6 +49,13 @@ const LIVESTREAM_PATH: &str = "/proxy/protect/api/ws/livestream";
 /// rewrite it to the console address, as on multi-homed consoles.
 const LIVESTREAM_WS_PATH: &str = "/ws/livestream";
 const LIVESTREAM_INTERNAL_HOST: &str = "unifi.internal";
+const EVENTS_PATH: &str = "/proxy/protect/api/events";
+/// Most events one history request returns, whatever `limit` asks for.
+const HISTORY_PAGE_MAX: usize = 200;
+const HISTORY_DAYS: u64 = 8;
+/// How long after an event ends its thumbnail answers 404 (about a second on Protect 7.2).
+const THUMBNAIL_PENDING: Duration = Duration::from_millis(1200);
+const NOT_FOUND_RESOURCE: &str = r#"{"error":"Resource does not exist."}"#;
 
 struct CameraDef {
     id: &'static str,
@@ -93,6 +105,8 @@ struct State {
     /// Single-use livestream websocket tokens.
     livestream_tokens: HashMap<String, LivestreamTarget>,
     livestream_broken: bool,
+    /// Private-API events, sorted by start.
+    history: Vec<Value>,
 }
 
 struct Mock {
@@ -183,7 +197,31 @@ impl Mock {
 
     fn publish_event(&self, frame: Value) {
         eprintln!("mock: event {frame}");
+        self.record(&frame["item"]);
         let _ = self.events.send(frame.to_string());
+    }
+
+    /// Adds an event from the websocket to the history, or applies an update to it.
+    fn record(&self, item: &Value) {
+        let Some(id) = item["id"].as_str() else { return };
+        let mut state = self.state();
+        if let Some(event) = state.history.iter_mut().rev().find(|e| e["id"] == id) {
+            for key in ["end", "smartDetectTypes"] {
+                if !item[key].is_null() {
+                    event[key] = item[key].clone();
+                }
+            }
+            return;
+        }
+        let (Some(kind), Some(start)) = (item["type"].as_str(), item["start"].as_u64()) else { return };
+        let types: Vec<&str> =
+            item["smartDetectTypes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let event = history_event(id, kind, start, item["end"].as_u64(), item["device"].as_str(), &types, json!({}));
+        insert_sorted(&mut state.history, event);
+    }
+
+    fn logged_in(&self, head: &Head) -> bool {
+        session_token(head).is_some_and(|token| self.state().sessions.contains(token))
     }
 
     fn camera_json(&self, index: usize) -> Value {
@@ -246,6 +284,7 @@ async fn main() -> io::Result<()> {
             login_failures: VecDeque::new(),
             livestream_tokens: HashMap::new(),
             livestream_broken: false,
+            history: Vec::new(),
         }),
         events: broadcast::channel(64).0,
         devices: broadcast::channel(64).0,
@@ -254,6 +293,7 @@ async fn main() -> io::Result<()> {
         port,
         livestreams: Mutex::new(HashMap::new()),
     });
+    seed_history(&mock);
     let listener = TcpListener::bind((bind.as_str(), port)).await?;
     eprintln!(
         "mock: Protect on http://{bind}:{port} (api key \"{API_KEY}\", events every {interval_secs}s, drawtext {})",
@@ -439,7 +479,13 @@ async fn route(mock: &Arc<Mock>, head: &Head, url: &reqwest::Url, body: &[u8]) -
         }
         ("POST", "/api/auth/login") => return login(mock, body),
         ("GET", LIVESTREAM_PATH) => return livestream_endpoint(mock, head, &query),
+        ("GET", EVENTS_PATH) => return events_endpoint(mock, head, &query),
         _ => {}
+    }
+    if head.method == "GET"
+        && let Some(id) = url.path().strip_prefix(EVENTS_PATH).and_then(|p| p.strip_prefix('/')?.strip_suffix("/thumbnail"))
+    {
+        return thumbnail_endpoint(mock, head, id).await;
     }
     let Some(path) = url.path().strip_prefix(API) else { return not_found() };
     if !head.authorized() {
@@ -650,12 +696,9 @@ struct LivestreamTarget {
 /// `GET /proxy/protect/api/ws/livestream?camera=…&channel=…&type=fmp4…` → `{"url": "ws://…"}`, a
 /// single-use URL on an internal hostname (clients rewrite the host and keep port and token).
 fn livestream_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<String>) -> Reply {
-    let cookie = head
-        .header("cookie")
-        .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|pair| pair.strip_prefix("TOKEN=")));
     let token = mock.new_id();
     let mut state = mock.state();
-    if !cookie.is_some_and(|cookie| state.sessions.contains(cookie)) {
+    if !session_token(head).is_some_and(|cookie| state.sessions.contains(cookie)) {
         return json_reply(401, &json!({"error": "Unauthorized"}));
     }
     if state.livestream_broken {
@@ -678,6 +721,137 @@ fn livestream_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<
     state.livestream_tokens.insert(token.clone(), target);
     let url = format!("ws://{LIVESTREAM_INTERNAL_HOST}:{}{LIVESTREAM_WS_PATH}?token={token}", mock.port);
     json_reply(200, &json!({ "url": url }))
+}
+
+/// The UniFi OS session from the request's `TOKEN` cookie.
+fn session_token(head: &Head) -> Option<&str> {
+    head.header("cookie")
+        .and_then(|cookies| cookies.split(';').map(str::trim).find_map(|pair| pair.strip_prefix("TOKEN=")))
+}
+
+// ---- event history ----------------------------------------------------------------------------
+
+/// An event as Protect's private API lists it.
+fn history_event(
+    id: &str,
+    kind: &str,
+    start: u64,
+    end: Option<u64>,
+    camera: Option<&str>,
+    types: &[&str],
+    metadata: Value,
+) -> Value {
+    json!({
+        "id": id, "modelKey": "event", "type": kind, "start": start, "end": end,
+        "score": if camera.is_some() { 80 } else { 0 }, "smartDetectTypes": types, "camera": camera,
+        "partition": null, "user": null, "metadata": metadata, "thumbnail": format!("e-{id}"),
+        "heatmap": format!("e-{id}"), "timestamp": start, "isFavorite": false, "favoriteObjectIds": null,
+        "description": {}, "category": null,
+    })
+}
+
+fn insert_sorted(history: &mut Vec<Value>, event: Value) {
+    let start = event["start"].as_u64();
+    let at = history.partition_point(|e| e["start"].as_u64() <= start);
+    history.insert(at, event);
+}
+
+/// `HISTORY_DAYS` of made-up events, one every one to nine minutes. Every seventh starts in the
+/// same millisecond as the one before (real consoles have such pairs), so paging by start time
+/// must neither lose nor repeat events; every fifteenth is not a camera event.
+fn seed_history(mock: &Mock) {
+    let now = now_ms();
+    let mut start = now - HISTORY_DAYS * 86_400_000;
+    let mut history = Vec::new();
+    for n in 0u64.. {
+        let r = mock.random();
+        if n % 7 != 6 {
+            start += 60_000 + r % 480_000;
+        }
+        let end = start + 3_000 + (r >> 20) % 27_000;
+        if end > now {
+            break;
+        }
+        let id = mock.new_uuid();
+        let event = if n % 15 == 14 {
+            let (kind, metadata) = match (n / 15) % 5 {
+                0 => ("access", json!({"ip": "192.0.2.10", "clientPlatform": "web", "user": {"text": "Mock Admin"}})),
+                1 => ("adminActivity", json!({"ip": "192.0.2.11", "action": "login", "user": {"text": "Mock Admin"}})),
+                2 => ("userArrived", json!({"user": {"text": "Mock Resident"}})),
+                3 => ("userLeft", json!({"user": {"text": "Mock Resident"}})),
+                _ => ("deviceConnected", json!({"device": {"text": "Mock Chime"}})),
+            };
+            history_event(&id, kind, start, Some(end), None, &[], metadata)
+        } else {
+            let camera = (r >> 8) as usize % CAMERAS.len();
+            let types = CAMERAS[camera].types;
+            let smart = (!types.is_empty()).then(|| types[(r >> 16) as usize % types.len()]);
+            let (kind, detected) = match ((r >> 12) % 10, smart) {
+                (4..=6, Some(kind)) => ("smartDetectZone", vec![kind]),
+                (7, Some(kind)) => ("smartDetectLine", vec![kind]),
+                (8, _) => ("smartAudioDetect", vec!["alrmSmoke"]),
+                (9, _) if camera == FRONT_DOOR => ("ring", vec![]),
+                _ => ("motion", vec![]),
+            };
+            history_event(&id, kind, start, Some(end), Some(CAMERAS[camera].id), &detected, json!({}))
+        };
+        history.push(event);
+    }
+    eprintln!("mock: history of {} events over the last {HISTORY_DAYS} days", history.len());
+    // Generated in start order.
+    mock.state().history = history;
+}
+
+/// `GET /proxy/protect/api/events?start=…&end=…&limit=…&orderDirection=ASC|DESC`: events whose
+/// start is in `[start, end]` (Unix ms, inclusive) ordered by start, ascending unless asked
+/// otherwise, like Protect 7.2; but never more than `HISTORY_PAGE_MAX`.
+fn events_endpoint(mock: &Mock, head: &Head, query: &dyn Fn(&str) -> Option<String>) -> Reply {
+    if !mock.logged_in(head) {
+        return json_reply(401, &json!({"error": "Unauthorized"}));
+    }
+    let number = |key: &str| query(key).and_then(|v| v.parse::<u64>().ok());
+    let (Some(start), Some(end)) = (number("start"), number("end")) else {
+        return json_reply(
+            400,
+            &json!({"error": "`start` and `end` are both required unless a valid `limit` is passed (1-100)."}),
+        );
+    };
+    let limit = number("limit").map_or(HISTORY_PAGE_MAX, |limit| (limit as usize).min(HISTORY_PAGE_MAX));
+    let descending = query("orderDirection").is_some_and(|d| d.eq_ignore_ascii_case("desc"));
+    let state = mock.state();
+    let from = state.history.partition_point(|e| e["start"].as_u64() < Some(start));
+    let to = state.history.partition_point(|e| e["start"].as_u64() <= Some(end));
+    let window = &state.history[from..to.max(from)];
+    let page: Vec<Value> = if descending {
+        window.iter().rev().take(limit).cloned().collect()
+    } else {
+        window.iter().take(limit).cloned().collect()
+    };
+    json_reply(200, &Value::Array(page))
+}
+
+/// `GET /proxy/protect/api/events/<id>/thumbnail`: a picture from the event's camera, as on
+/// Protect 7.2: a current frame while the event lasts, 404 for `THUMBNAIL_PENDING` after it ends
+/// (while the final thumbnail is made), then the thumbnail. 404 for unknown ids (including
+/// `e-<id>`) and other event types.
+async fn thumbnail_endpoint(mock: &Mock, head: &Head, id: &str) -> Reply {
+    if !mock.logged_in(head) {
+        return json_reply(401, &json!({"error": "Unauthorized"}));
+    }
+    let pending = |end: &Value| end.as_u64().is_some_and(|end| now_ms() < end + THUMBNAIL_PENDING.as_millis() as u64);
+    let camera = mock
+        .state()
+        .history
+        .iter()
+        .find(|e| e["id"] == id && !pending(&e["end"]))
+        .and_then(|e| camera_index(e["camera"].as_str()?));
+    let Some(camera) = camera else {
+        return Reply::new(404, "application/json", NOT_FOUND_RESOURCE.as_bytes().to_vec());
+    };
+    match render_snapshot(mock, camera, false).await {
+        Ok(jpeg) => Reply::new(200, "image/jpeg", jpeg),
+        Err(err) => json_reply(500, &json!({"error": err.to_string(), "name": "API_ERROR"})),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

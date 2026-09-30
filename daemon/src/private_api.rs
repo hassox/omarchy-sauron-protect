@@ -1,4 +1,5 @@
-//! UniFi OS login (a local service account, no MFA) and Protect's private livestream endpoint.
+//! UniFi OS login (a local service account, no MFA) and Protect's private API: the livestream
+//! endpoint, event history and event thumbnails.
 //!
 //! Protocol as implemented by hjdhjd/unifi-protect (src/transport/auth.ts, ws-endpoint.ts,
 //! livestream-session.ts) and uilibs/uiprotect (api.py):
@@ -8,6 +9,12 @@
 //!   `MFA_AUTH_REQUIRED` = MFA, 429 = too many attempts.
 //! - `GET /proxy/protect/api/ws/livestream?…` answers `{"url": "wss://…"}`; the URL carries its own
 //!   token, and its hostname may be internal, so it is replaced with the active console address.
+//! - `GET /proxy/protect/api/events?start=…&end=…&limit=…&orderDirection=ASC` lists events whose
+//!   start lies in `[start, end]` (Unix ms, both inclusive), ordered by start.
+//! - `GET /proxy/protect/api/events/<id>/thumbnail` is the event's JPEG (uiprotect
+//!   `get_event_thumbnail`): a current frame while the event lasts, then, after about a second of
+//!   404 when it ends, the final thumbnail; 404 for other event types and unknown ids. Events also
+//!   carry a `thumbnail` id, `e-<id>`; the endpoint wants the bare id.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -19,6 +26,7 @@ use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OnceCell};
+use tokio_tungstenite::tungstenite::Bytes;
 
 use crate::config;
 use crate::keyring;
@@ -26,6 +34,7 @@ use crate::protect::{Protect, error_chain};
 
 const LOGIN_PATH: &str = "/api/auth/login";
 const LIVESTREAM_PATH: &str = "/proxy/protect/api/ws/livestream";
+const EVENTS_PATH: &str = "/proxy/protect/api/events";
 /// UniFi OS answers an MFA-protected account with this non-standard status.
 const MFA_STATUS: u16 = 499;
 /// Largest livestream frame payload we ask for (the protocol's own limit is 2^24 - 1).
@@ -271,23 +280,9 @@ impl<'a> PrivateApi<'a> {
         csrf_header(response.headers())
     }
 
-    /// The websocket URL for a camera's livestream, host rewritten to the active console address.
-    /// Logs in again once if the cached session has expired.
-    pub async fn livestream_url(&mut self, camera: &str, channel: u8) -> Result<String> {
-        let mut url = Url::parse(&format!("{}{LIVESTREAM_PATH}", self.protect.origin()))?;
-        url.query_pairs_mut()
-            .append_pair("allowPartialGOP", "")
-            .append_pair("camera", camera)
-            .append_pair("channel", &channel.to_string())
-            .append_pair("chunkSize", CHUNK_SIZE)
-            .append_pair("fragmentDurationMillis", FRAGMENT_MILLIS)
-            .append_pair("lens", "0")
-            .append_pair("progressive", "")
-            .append_pair("rebaseTimestampsToZero", "true")
-            .append_pair("requestId", &format!("sauron-{camera}-{channel}"))
-            .append_pair("type", "fmp4")
-            .append_pair("useWallClock", "false");
-
+    /// GETs `url` with the session, logging in again once if the cached session has expired.
+    /// Returns the status and body; 403 (no access to Protect) is an error.
+    async fn get(&mut self, url: &Url) -> Result<(StatusCode, Bytes)> {
         let mut relogged = false;
         loop {
             let session = self.session().await?.clone();
@@ -312,22 +307,69 @@ impl<'a> PrivateApi<'a> {
                 self.session = Some(session);
             }
             let body = response.bytes().await.map_err(|e| anyhow!(error_chain(&e)))?;
-            match status {
-                StatusCode::FORBIDDEN => {
-                    return Err(anyhow!("the UniFi user may not view Protect (give it Protect: View Only)"));
-                }
-                status if !status.is_success() => return Err(anyhow!("{LIVESTREAM_PATH}: HTTP {status}")),
-                _ => {}
+            if status == StatusCode::FORBIDDEN {
+                return Err(anyhow!("the UniFi user may not view Protect (give it Protect: View Only)"));
             }
-            #[derive(Deserialize)]
-            struct Endpoint {
-                url: String,
-            }
-            let endpoint: Endpoint =
-                serde_json::from_slice(&body).with_context(|| format!("{LIVESTREAM_PATH}: unexpected response"))?;
-            let mut ws = Url::parse(&endpoint.url).with_context(|| format!("invalid livestream URL {:?}", endpoint.url))?;
-            ws.set_host(Some(self.protect.hostname())).context("cannot rewrite the livestream host")?;
-            return Ok(ws.into());
+            return Ok((status, body));
+        }
+    }
+
+    /// The websocket URL for a camera's livestream, host rewritten to the active console address.
+    pub async fn livestream_url(&mut self, camera: &str, channel: u8) -> Result<String> {
+        let mut url = Url::parse(&format!("{}{LIVESTREAM_PATH}", self.protect.origin()))?;
+        url.query_pairs_mut()
+            .append_pair("allowPartialGOP", "")
+            .append_pair("camera", camera)
+            .append_pair("channel", &channel.to_string())
+            .append_pair("chunkSize", CHUNK_SIZE)
+            .append_pair("fragmentDurationMillis", FRAGMENT_MILLIS)
+            .append_pair("lens", "0")
+            .append_pair("progressive", "")
+            .append_pair("rebaseTimestampsToZero", "true")
+            .append_pair("requestId", &format!("sauron-{camera}-{channel}"))
+            .append_pair("type", "fmp4")
+            .append_pair("useWallClock", "false");
+
+        let (status, body) = self.get(&url).await?;
+        if !status.is_success() {
+            return Err(anyhow!("{LIVESTREAM_PATH}: HTTP {status}"));
+        }
+        #[derive(Deserialize)]
+        struct Endpoint {
+            url: String,
+        }
+        let endpoint: Endpoint =
+            serde_json::from_slice(&body).with_context(|| format!("{LIVESTREAM_PATH}: unexpected response"))?;
+        let mut ws = Url::parse(&endpoint.url).with_context(|| format!("invalid livestream URL {:?}", endpoint.url))?;
+        ws.set_host(Some(self.protect.hostname())).context("cannot rewrite the livestream host")?;
+        Ok(ws.into())
+    }
+
+    /// Up to `limit` events (a JSON array, with metadata) that started in `[start, end]` (Unix ms,
+    /// inclusive), oldest first.
+    pub async fn events(&mut self, start: i64, end: i64, limit: usize) -> Result<Bytes> {
+        let mut url = Url::parse(&format!("{}{EVENTS_PATH}", self.protect.origin()))?;
+        url.query_pairs_mut()
+            .append_pair("start", &start.to_string())
+            .append_pair("end", &end.to_string())
+            .append_pair("limit", &limit.to_string())
+            .append_pair("orderDirection", "ASC")
+            .append_pair("withoutDescriptions", "false");
+        let (status, body) = self.get(&url).await?;
+        if !status.is_success() {
+            return Err(anyhow!("{EVENTS_PATH}: HTTP {status}"));
+        }
+        Ok(body)
+    }
+
+    /// The event's thumbnail JPEG; `None` when Protect has none for it (404).
+    pub async fn event_thumbnail(&mut self, id: &str) -> Result<Option<Bytes>> {
+        let mut url = Url::parse(&format!("{}{EVENTS_PATH}", self.protect.origin()))?;
+        url.path_segments_mut().map_err(|()| anyhow!("cannot build the thumbnail URL"))?.extend([id, "thumbnail"]);
+        match self.get(&url).await? {
+            (StatusCode::NOT_FOUND, _) => Ok(None),
+            (status, _) if !status.is_success() => Err(anyhow!("{EVENTS_PATH}/{id}/thumbnail: HTTP {status}")),
+            (_, body) => Ok(Some(body)),
         }
     }
 }

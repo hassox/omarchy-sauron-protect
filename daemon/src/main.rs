@@ -1,5 +1,7 @@
 mod config;
 mod daemon;
+mod event_log;
+mod history;
 mod hypr;
 mod keyring;
 mod live;
@@ -27,6 +29,12 @@ usage:
   sauron cameras                    list cameras
   sauron live <camera>              open the live view (camera id or name)
   sauron snapshot <camera> [out]    save a snapshot (default ./<name>.jpg)
+  sauron log [--since <when>] [--until <when>] [--all]
+                                    print Protect's event history as JSON lines, oldest first;
+                                    <when> is 30m, 24h, 7d, YYYY-MM-DD, \"YYYY-MM-DD HH:MM\" or
+                                    RFC 3339 (default: the last 24h). --all adds every other event
+                                    type, including admin logins with IP addresses and presence
+  sauron thumbnail <event-id> [out] save an event's thumbnail (default ./<event-id>.jpg)
   sauron --version                  print the version
 ";
 
@@ -45,6 +53,15 @@ async fn main() -> ExitCode {
         ["live", camera] => live::run(camera).await,
         ["snapshot", camera] => snapshot(camera, None).await,
         ["snapshot", camera, out] => snapshot(camera, Some(out)).await,
+        ["log", rest @ ..] => match history::LogArgs::parse(rest) {
+            Some(args) => history::log(args).await,
+            None => {
+                eprint!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        },
+        ["thumbnail", id] => history::thumbnail(id, None).await,
+        ["thumbnail", id, out] => history::thumbnail(id, Some(out)).await,
         ["--version" | "-V"] => {
             println!("sauron {}", env!("CARGO_PKG_VERSION"));
             Ok(())

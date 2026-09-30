@@ -27,6 +27,8 @@ pub struct Config {
     pub username: String,
     pub live_quality: String,
     pub player: Vec<String>,
+    /// JSON Lines file that `sauron watch` appends every camera event to; `None` = off.
+    pub event_log: Option<PathBuf>,
 }
 
 /// The config file as written, before validation. Unknown keys (such as the old `verify_tls`)
@@ -42,6 +44,7 @@ pub struct Settings {
     pub username: String,
     pub live_quality: String,
     pub player: Vec<String>,
+    pub event_log: String,
 }
 
 impl Default for Settings {
@@ -55,6 +58,7 @@ impl Default for Settings {
             username: String::new(),
             live_quality: "high".into(),
             player: DEFAULT_PLAYER.map(String::from).to_vec(),
+            event_log: String::new(),
         }
     }
 }
@@ -161,6 +165,22 @@ impl Settings {
             }
             _ => return invalid("set only one of `api_key` and `api_key_command`".into()),
         };
+        let event_log = match self.event_log.trim() {
+            "" => None,
+            path => {
+                let path = match path.strip_prefix("~/") {
+                    Some(rest) => match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+                        Some(home) => PathBuf::from(home).join(rest),
+                        None => return invalid("`event_log` starts with ~/ but HOME is not set".into()),
+                    },
+                    None => PathBuf::from(path),
+                };
+                if !path.is_absolute() {
+                    return invalid(format!("`event_log` must be an absolute path or start with ~/, not {path:?}"));
+                }
+                Some(path)
+            }
+        };
         Ok(Config {
             host,
             fallback_hosts,
@@ -169,6 +189,7 @@ impl Settings {
             username: self.username.trim().to_owned(),
             live_quality: self.live_quality,
             player: self.player,
+            event_log,
         })
     }
 }
@@ -233,6 +254,8 @@ username = {username}
 live_quality = {live_quality}
 # Player argv; \"--title=<Sauron · camera>\" (mpv only) and the stream URL (or \"-\" for instant live) are appended.
 player = {player}
+# Append every camera event to this file as JSON Lines (off when empty). Rotate it however you like.
+event_log = {event_log}
 ",
         host = string(&address(&settings.host)),
         fallback_hosts = array(&fallback_hosts),
@@ -241,6 +264,7 @@ player = {player}
         username = string(settings.username.trim()),
         live_quality = string(&settings.live_quality),
         player = array(&settings.player),
+        event_log = string(settings.event_log.trim()),
     )
 }
 

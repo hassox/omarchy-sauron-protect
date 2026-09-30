@@ -17,6 +17,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior, interval, sleep, sleep_
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 
 use crate::config::{self, Config};
+use crate::event_log::{self, CameraLine, EVENT_TYPES, Time, event_kinds};
 use crate::notify::{Notification, Notifier};
 use crate::private_api::{self, Warmer};
 use crate::proto::{CameraOut, Command, Level, Msg, Out, PROTOCOL, Phase, State};
@@ -34,8 +35,6 @@ const NETWORK_SETTLE: Duration = Duration::from_secs(2);
 const AUTH_BACKOFF: Duration = Duration::from_secs(60);
 const EVENT_IMAGES_KEPT: usize = 50;
 const ENDED_REMEMBERED: usize = 256;
-const EVENT_TYPES: [&str; 6] =
-    ["ring", "motion", "smartDetectZone", "smartDetectLine", "smartDetectLoiterZone", "smartAudioDetect"];
 
 /// Messages from spawned tasks to the main loop. `generation` tags data from a connection
 /// session so results from a superseded config are dropped.
@@ -152,6 +151,9 @@ struct Daemon {
     watch: Option<Interval>,
     in_flight: HashSet<String>,
     snapshot_errors: HashMap<String, String>,
+    /// Where camera events are appended as JSON Lines (`event_log`); `None` = off.
+    event_log: Option<Arc<Path>>,
+    event_writer: event_log::Writer,
 }
 
 enum Wake {
@@ -171,6 +173,11 @@ pub async fn run() -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(read_stdin(tx.clone()));
+    let log_tx = tx.clone();
+    let event_writer = event_log::Writer::new(move |message| {
+        let _ = log_tx.send(Internal::Log(Level::Warn, message));
+    })
+    .context("cannot start the event log writer")?;
 
     let mut daemon = Daemon {
         out: Out::new(),
@@ -200,6 +207,8 @@ pub async fn run() -> Result<()> {
         watch: None,
         in_flight: HashSet::new(),
         snapshot_errors: HashMap::new(),
+        event_log: None,
+        event_writer,
     };
 
     emit(&mut daemon.out, &Msg::Hello { version: env!("CARGO_PKG_VERSION"), protocol: PROTOCOL }).await;
@@ -293,16 +302,6 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Kinds of an event, normalized for filtering and display.
-fn event_kinds(event_type: &str, smart_detect_types: Option<&[String]>) -> Vec<String> {
-    match event_type {
-        "ring" => vec!["ring".into()],
-        "motion" => vec!["motion".into()],
-        "smartAudioDetect" => vec!["audio".into()],
-        _ => smart_detect_types.map(<[String]>::to_vec).unwrap_or_default(),
-    }
-}
-
 impl Daemon {
     async fn log(&mut self, level: Level, message: &str) {
         emit(&mut self.out, &Msg::Log { level, message }).await;
@@ -349,6 +348,7 @@ impl Daemon {
         match config {
             Ok(config) => {
                 self.set_status(State::Connecting, None, None, None).await;
+                self.event_log = config.event_log.as_deref().map(Arc::from);
                 let warmer = (!config.username.is_empty()).then(|| Arc::new(Warmer::new(config.username.clone())));
                 let (network, network_rx) = mpsc::unbounded_channel();
                 let task = tokio::spawn(run_session(self.generation, config.clone(), self.tx.clone(), network_rx));
@@ -356,6 +356,7 @@ impl Daemon {
             }
             Err(message) => {
                 self.set_status(State::Unconfigured, Some(message), None, None).await;
+                self.event_log = None;
                 self.cameras.clear();
                 self.emit_cameras().await;
             }
@@ -588,7 +589,7 @@ impl Daemon {
                 }
             }
             if let Some(end) = item.end {
-                self.end_event(&id, end).await;
+                self.end_event(&id, end, false).await;
             }
             return;
         }
@@ -604,12 +605,13 @@ impl Daemon {
         let kinds = event_kinds(&event_type, item.smart_detect_types.as_deref());
         self.events.insert(id.clone(), OpenEvent { camera, event_type, kinds, start, seen: Instant::now() });
         self.emit_event(Phase::Start, &id, None).await;
+        self.log_event(Phase::Start, &id, None, false);
         let open = &self.events[&id];
         if self.filter.matches(&open.camera, &open.kinds) {
             self.event_actions(&id);
         }
         if let Some(end) = item.end {
-            self.end_event(&id, end).await;
+            self.end_event(&id, end, false).await;
         }
     }
 
@@ -628,8 +630,29 @@ impl Daemon {
         emit(&mut self.out, &msg).await;
     }
 
-    async fn end_event(&mut self, id: &str, end: i64) {
+    /// Appends a `start` or `end` line to the event log, if one is configured.
+    fn log_event(&self, phase: Phase, id: &str, end: Option<i64>, forced: bool) {
+        let (Some(path), Some(open)) = (&self.event_log, self.events.get(id)) else { return };
+        let line = CameraLine {
+            phase,
+            id,
+            camera: self.camera_name(&open.camera),
+            camera_id: &open.camera,
+            event_type: &open.event_type,
+            kinds: &open.kinds,
+            matched: Some(self.filter.matches(&open.camera, &open.kinds)),
+            start: Time(open.start),
+            end: end.map(Time),
+            duration_s: end.map(|end| event_log::duration_s(open.start, end)),
+            forced,
+        };
+        self.event_writer.write(path, &line);
+    }
+
+    /// `forced`: ended by us (disconnect, reload, TTL sweep) rather than by Protect.
+    async fn end_event(&mut self, id: &str, end: i64, forced: bool) {
         self.emit_event(Phase::End, id, Some(end)).await;
+        self.log_event(Phase::End, id, Some(end), forced);
         self.events.remove(id);
         if self.ended.len() == ENDED_REMEMBERED {
             self.ended.pop_front();
@@ -641,7 +664,7 @@ impl Daemon {
         let ids: Vec<String> = self.events.keys().cloned().collect();
         let now = now_ms();
         for id in ids {
-            self.end_event(&id, now).await;
+            self.end_event(&id, now, true).await;
         }
     }
 
@@ -650,7 +673,7 @@ impl Daemon {
             self.events.iter().filter(|(_, e)| e.seen.elapsed() > EVENT_TTL).map(|(id, _)| id.clone()).collect();
         let now = now_ms();
         for id in stale {
-            self.end_event(&id, now).await;
+            self.end_event(&id, now, true).await;
         }
     }
 
