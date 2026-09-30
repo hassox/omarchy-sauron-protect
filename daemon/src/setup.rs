@@ -61,7 +61,11 @@ async fn wizard() -> Result<()> {
             Settings::default()
         }
     };
-    gum(&["style", "--bold", "--padding", "0 1", "Sauron setup"], Stdio::inherit()).await?;
+    gum(
+        &["style", "--bold", "--padding", "0 1", "Sauron setup"],
+        Stdio::inherit(),
+    )
+    .await?;
     let (host, pin) = ask_host(&settings).await?;
     settings.host = host;
     settings.cert_sha256 = pin.map(|pin| pin.to_string()).unwrap_or_default();
@@ -93,26 +97,33 @@ fn probe_config(host: &str, pin: Option<Fingerprint>) -> Config {
 async fn ask_host(settings: &Settings) -> Result<(String, Option<Fingerprint>)> {
     let mut default = config::address(&settings.host);
     if default.is_empty() {
-        default = config::default_gateway().await.map(|ip| ip.to_string()).unwrap_or_default();
+        default = config::default_gateway()
+            .await
+            .map(|ip| ip.to_string())
+            .unwrap_or_default();
     }
     let old_pin = Fingerprint::parse(&settings.cert_sha256);
     loop {
-        let host = config::address(&input("Console address", &default, "IP or hostname", false).await?);
+        let host =
+            config::address(&input("Console address", &default, "IP or hostname", false).await?);
         if host.is_empty() {
             continue;
         }
         default.clone_from(&host);
-        let (status, leaf, plain) = match spin("Looking for the console…", find_console(&host)).await {
-            Ok(found) => found,
-            Err(err) => {
-                fail(&format!("Cannot reach {host}: {err:#}"));
-                continue;
-            }
-        };
+        let (status, leaf, plain) =
+            match spin("Looking for the console…", find_console(&host)).await {
+                Ok(found) => found,
+                Err(err) => {
+                    fail(&format!("Cannot reach {host}: {err:#}"));
+                    continue;
+                }
+            };
         if status == StatusCode::UNAUTHORIZED {
             done("UniFi console found");
         } else {
-            warn(&format!("{host} answered HTTP {status}; it doesn't look like a UniFi console"));
+            warn(&format!(
+                "{host} answered HTTP {status}; it doesn't look like a UniFi console"
+            ));
             if !confirm("Continue anyway?", false).await? {
                 continue;
             }
@@ -130,8 +141,14 @@ async fn ask_host(settings: &Settings) -> Result<(String, Option<Fingerprint>)> 
             warn("The console's certificate changed. Only trust it on your home network.");
         }
         let (common_name, self_signed) = tls::describe(&leaf).unwrap_or((None, false));
-        let kind = if self_signed { "self-signed" } else { "not publicly trusted" };
-        let name = common_name.map(|cn| format!(", CN={cn}")).unwrap_or_default();
+        let kind = if self_signed {
+            "self-signed"
+        } else {
+            "not publicly trusted"
+        };
+        let name = common_name
+            .map(|cn| format!(", CN={cn}"))
+            .unwrap_or_default();
         println!("Console certificate: SHA256 {} ({kind}{name})", pin.short());
         if confirm("Trust this console?", true).await? {
             return Ok((host, Some(pin)));
@@ -149,7 +166,9 @@ async fn find_console(host: &str) -> Result<(StatusCode, Option<CertificateDer<'
         Ok(status) => return Ok((status, None, plain)),
         Err(err) => err,
     };
-    let Some(Rejection::Untrusted { leaf, .. }) = protect::rejection(&err) else { return Err(err) };
+    let Some(Rejection::Untrusted { leaf, .. }) = protect::rejection(&err) else {
+        return Err(err);
+    };
     let leaf = leaf.clone();
     let pinned = Protect::new(&probe_config(host, Some(Fingerprint::of(&leaf))), host)?;
     Ok((pinned.probe().await?, Some(leaf), plain))
@@ -158,8 +177,13 @@ async fn find_console(host: &str) -> Result<(StatusCode, Option<CertificateDer<'
 /// Step 2: the Integration API key, verified with `meta/info` and the camera list.
 async fn ask_api_key(settings: &mut Settings) -> Result<(Protect, Vec<Camera>)> {
     println!("{KEY_HINT}");
-    let has_key = !settings.api_key.trim().is_empty() || !settings.api_key_command.trim().is_empty();
-    let placeholder = if has_key { "Enter keeps the current key" } else { "paste the key" };
+    let has_key =
+        !settings.api_key.trim().is_empty() || !settings.api_key_command.trim().is_empty();
+    let placeholder = if has_key {
+        "Enter keeps the current key"
+    } else {
+        "paste the key"
+    };
     loop {
         let key = input("API key", "", placeholder, true).await?;
         let mut candidate = settings.clone();
@@ -171,7 +195,10 @@ async fn ask_api_key(settings: &mut Settings) -> Result<(Protect, Vec<Camera>)> 
             continue;
         }
         // Other addresses are checked in the next step.
-        let keyed = Settings { fallback_hosts: Vec::new(), ..candidate.clone() };
+        let keyed = Settings {
+            fallback_hosts: Vec::new(),
+            ..candidate.clone()
+        };
         let config = match keyed.validate().await {
             Ok(config) => config,
             Err(LoadError::NotSetUp) => {
@@ -218,14 +245,23 @@ async fn ask_other_addresses(settings: &mut Settings, pin: Option<Fingerprint>) 
         let checked = if addresses.is_empty() {
             Vec::new()
         } else {
-            let checks = join_all(addresses.iter().map(|address| check_address(&probe, address)));
-            spin("Checking the addresses…", async { anyhow::Ok(checks.await) }).await?
+            let checks = join_all(
+                addresses
+                    .iter()
+                    .map(|address| check_address(&probe, address)),
+            );
+            spin("Checking the addresses…", async {
+                anyhow::Ok(checks.await)
+            })
+            .await?
         };
         let mut rejected = false;
         for (address, reach) in addresses.iter().zip(checked) {
             match reach {
                 Reach::Console => done(&format!("{address} reaches your console")),
-                Reach::Silent => warn(&format!("{address} doesn't answer right now; kept for later")),
+                Reach::Silent => warn(&format!(
+                    "{address} doesn't answer right now; kept for later"
+                )),
                 Reach::Different => {
                     fail(&format!("{address} is a different machine"));
                     rejected = true;
@@ -277,7 +313,11 @@ async fn check_address(probe: &Config, address: &str) -> Reach {
 }
 
 /// Step 4 (optional): a local UniFi OS user for the private livestream; password to the keyring.
-async fn ask_instant_live(settings: &mut Settings, client: &Protect, cameras: &[Camera]) -> Result<()> {
+async fn ask_instant_live(
+    settings: &mut Settings,
+    client: &Protect,
+    cameras: &[Camera],
+) -> Result<()> {
     println!("{INSTANT_HINT}");
     if !confirm("Set up instant live?", !settings.username.trim().is_empty()).await? {
         settings.username.clear();
@@ -293,7 +333,11 @@ async fn ask_instant_live(settings: &mut Settings, client: &Protect, cameras: &[
             continue;
         }
         let saved = keyring::lookup(client.console_id(), &username).await;
-        let placeholder = if saved.is_some() { "Enter keeps the saved password" } else { "" };
+        let placeholder = if saved.is_some() {
+            "Enter keeps the saved password"
+        } else {
+            ""
+        };
         let typed = input("Password", "", placeholder, true).await?;
         let Some(password) = Some(typed).filter(|p| !p.is_empty()).or(saved) else {
             fail("A password is needed");
@@ -330,9 +374,12 @@ fn login_message(err: &anyhow::Error) -> String {
     match err.downcast_ref::<LoginError>() {
         Some(LoginError::BadCredentials) => "Wrong username or password".into(),
         Some(LoginError::MfaRequired) => {
-            "This account uses MFA, which sauron can't answer. Use a local-only UniFi user instead".into()
+            "This account uses MFA, which sauron can't answer. Use a local-only UniFi user instead"
+                .into()
         }
-        Some(LoginError::RateLimited(_)) => "Too many login attempts; the console is refusing logins for now".into(),
+        Some(LoginError::RateLimited(_)) => {
+            "Too many login attempts; the console is refusing logins for now".into()
+        }
         _ => format!("{err:#}"),
     }
 }
@@ -370,7 +417,15 @@ async fn gum(args: &[&str], stdout: Stdio) -> Result<String> {
 }
 
 async fn input(header: &str, value: &str, placeholder: &str, password: bool) -> Result<String> {
-    let mut args = vec!["input", "--header", header, "--value", value, "--placeholder", placeholder];
+    let mut args = vec![
+        "input",
+        "--header",
+        header,
+        "--value",
+        value,
+        "--placeholder",
+        placeholder,
+    ];
     if password {
         args.push("--password");
     }
@@ -379,7 +434,15 @@ async fn input(header: &str, value: &str, placeholder: &str, password: bool) -> 
 
 async fn confirm(prompt: &str, default: bool) -> Result<bool> {
     let status = Command::new("gum")
-        .args(["confirm", prompt, if default { "--default=true" } else { "--default=false" }])
+        .args([
+            "confirm",
+            prompt,
+            if default {
+                "--default=true"
+            } else {
+                "--default=false"
+            },
+        ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -397,7 +460,16 @@ async fn confirm(prompt: &str, default: bool) -> Result<bool> {
 /// placeholder `sleep` and is stopped with SIGTERM (which restores the terminal) when done.
 async fn spin<T>(title: &str, work: impl Future<Output = Result<T>>) -> Result<T> {
     let spinner = Command::new("gum")
-        .args(["spin", "--spinner", "dot", "--title", title, "--", "sleep", "3600"])
+        .args([
+            "spin",
+            "--spinner",
+            "dot",
+            "--title",
+            title,
+            "--",
+            "sleep",
+            "3600",
+        ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

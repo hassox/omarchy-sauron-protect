@@ -30,7 +30,11 @@ pub struct Notifier {
 
 impl Notifier {
     pub fn new(exe: String) -> Self {
-        Self { exe, connection: OnceCell::new(), ids: Mutex::new(VecDeque::with_capacity(REMEMBERED_IDS)) }
+        Self {
+            exe,
+            connection: OnceCell::new(),
+            ids: Mutex::new(VecDeque::with_capacity(REMEMBERED_IDS)),
+        }
     }
 
     /// Shows (or updates in place) the notification for an event; returns its id.
@@ -41,7 +45,10 @@ impl Notifier {
             .await
             .context("cannot connect to the session bus")?;
         let mut ids = self.ids.lock().await;
-        let replaces = ids.iter().find(|(event, _)| event == n.event_id).map_or(0, |&(_, id)| id);
+        let replaces = ids
+            .iter()
+            .find(|(event, _)| event == n.event_id)
+            .map_or(0, |&(_, id)| id);
 
         let exec_argv = serde_json::to_string(&[self.exe.as_str(), "live", n.camera_id])?;
         let mut hints: HashMap<&str, Value<'_>> = HashMap::with_capacity(4);
@@ -61,11 +68,23 @@ impl Notifier {
                 "/org/freedesktop/Notifications",
                 Some("org.freedesktop.Notifications"),
                 "Notify",
-                &("Sauron", replaces, "", summary.as_str(), body.as_str(), actions, hints, -1i32),
+                &(
+                    "Sauron",
+                    replaces,
+                    "",
+                    summary.as_str(),
+                    body.as_str(),
+                    actions,
+                    hints,
+                    -1i32,
+                ),
             )
             .await
             .context("Notify failed")?;
-        let id: u32 = reply.body().deserialize().context("unexpected Notify reply")?;
+        let id: u32 = reply
+            .body()
+            .deserialize()
+            .context("unexpected Notify reply")?;
 
         ids.retain(|(event, _)| event != n.event_id);
         if ids.len() == REMEMBERED_IDS {
@@ -118,5 +137,21 @@ fn local_hms(ms: i64) -> String {
     match crate::event_log::local_tm(ms) {
         Some(tm) => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
         None => String::from("--:--:--"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_names_kinds_then_camera() {
+        let kinds: Vec<String> = ["person", "licensePlate", "audio", "smokeAlarm"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            summary(&kinds, "Driveway"),
+            "Person, License plate, Sound, SmokeAlarm · Driveway"
+        );
     }
 }

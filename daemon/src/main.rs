@@ -7,8 +7,8 @@ mod keyring;
 mod live;
 mod notify;
 mod private_api;
-mod proto;
 mod protect;
+mod proto;
 mod setup;
 mod tls;
 
@@ -104,7 +104,12 @@ async fn cameras() -> Result<()> {
 async fn list_cameras(client: &Protect) -> Result<()> {
     for camera in sorted_cameras(client).await? {
         let state = if camera.online() { "online" } else { "offline" };
-        println!("{state}\t{}\t{}\t{}", camera.display_name(), camera.model(), camera.id);
+        println!(
+            "{state}\t{}\t{}\t{}",
+            camera.display_name(),
+            camera.model(),
+            camera.id
+        );
     }
     Ok(())
 }
@@ -116,8 +121,16 @@ async fn check() -> Result<()> {
         Ok(connected) => connected,
         Err(err) => return Err(report(&err)),
     };
-    let via = if client.via().is_some() { " via fallback" } else { "" };
-    println!("Protect {version} at {} ({}){via}", client.address(), client.security());
+    let via = if client.via().is_some() {
+        " via fallback"
+    } else {
+        ""
+    };
+    println!(
+        "Protect {version} at {} ({}){via}",
+        client.address(),
+        client.security()
+    );
     list_cameras(&client).await
 }
 
@@ -154,11 +167,16 @@ pub fn resolve<'a>(cameras: &'a [Camera], query: &str) -> Result<&'a Camera> {
         return Ok(camera);
     }
     let query = query.to_lowercase();
-    if let Some(camera) = cameras.iter().find(|c| c.display_name().to_lowercase() == query) {
+    if let Some(camera) = cameras
+        .iter()
+        .find(|c| c.display_name().to_lowercase() == query)
+    {
         return Ok(camera);
     }
-    let matches: Vec<&Camera> =
-        cameras.iter().filter(|c| c.display_name().to_lowercase().starts_with(&query)).collect();
+    let matches: Vec<&Camera> = cameras
+        .iter()
+        .filter(|c| c.display_name().to_lowercase().starts_with(&query))
+        .collect();
     match matches.as_slice() {
         [camera] => Ok(camera),
         [] => bail!("no camera matches {query:?}"),
@@ -180,7 +198,13 @@ async fn snapshot(query: &str, out: Option<&str>) -> Result<()> {
             let name: String = camera
                 .display_name()
                 .chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
             PathBuf::from(format!("./{name}.jpg"))
         }
@@ -189,7 +213,56 @@ async fn snapshot(query: &str, out: Option<&str>) -> Result<()> {
         .snapshot(&camera.id, camera.supports_full_hd_snapshot())
         .await
         .with_context(|| format!("cannot fetch snapshot of {}", camera.display_name()))?;
-    tokio::fs::write(&path, &jpeg).await.with_context(|| format!("cannot write {}", path.display()))?;
+    tokio::fs::write(&path, &jpeg)
+        .await
+        .with_context(|| format!("cannot write {}", path.display()))?;
     println!("{}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cameras(names: &[(&str, &str)]) -> Vec<Camera> {
+        names
+            .iter()
+            .map(|&(id, name)| Camera {
+                id: id.into(),
+                name: Some(name.into()),
+                ..Camera::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolve_by_id_exact_name_then_unique_prefix() {
+        let cameras = cameras(&[
+            ("cam-a", "Garage"),
+            ("cam-b", "Garage Side"),
+            ("cam-c", "Front Door"),
+        ]);
+        let id = |query: &str| {
+            resolve(&cameras, query)
+                .map(|c| c.id.as_str())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(id("cam-c"), Ok("cam-c"));
+        // An exact name wins although it is also a prefix of another camera's name.
+        assert_eq!(id("gARAGE"), Ok("cam-a"));
+        assert_eq!(id("fro"), Ok("cam-c"));
+        assert_eq!(id("garage s"), Ok("cam-b"));
+    }
+
+    #[test]
+    fn resolve_reports_ambiguous_and_unknown_queries() {
+        let cameras = cameras(&[
+            ("cam-a", "Garage"),
+            ("cam-b", "Garage Side"),
+            ("cam-c", "Front Door"),
+        ]);
+        let error = |query: &str| resolve(&cameras, query).err().unwrap().to_string();
+        assert_eq!(error("Gar"), "\"gar\" is ambiguous: Garage, Garage Side");
+        assert_eq!(error("back"), "no camera matches \"back\"");
+    }
 }

@@ -20,8 +20,8 @@ use crate::config::{self, Config};
 use crate::event_log::{self, CameraLine, EVENT_TYPES, Time, event_kinds};
 use crate::notify::{Notification, Notifier};
 use crate::private_api::{self, Warmer};
-use crate::proto::{CameraOut, Command, Level, Msg, Out, PROTOCOL, Phase, State};
 use crate::protect::{self, Camera, DeviceItem, EventItem, Failure, Frame, Protect, WsStream};
+use crate::proto::{CameraOut, Command, Level, Msg, Out, PROTOCOL, Phase, State};
 
 const CONFIG_POLL: Duration = Duration::from_secs(3);
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -42,14 +42,39 @@ enum Internal {
     Stdin(Vec<u8>),
     StdinClosed,
     /// Not online (never `Online`: that comes with its client in `Connected`).
-    Status { generation: u64, state: State, message: String },
+    Status {
+        generation: u64,
+        state: State,
+        message: String,
+    },
     /// A session is up on `client`'s address.
-    Connected { generation: u64, client: Arc<Protect>, version: String, cameras: Vec<Camera> },
-    Cameras { generation: u64, cameras: Vec<Camera> },
-    Event { generation: u64, action: String, item: EventItem },
-    CameraPatch { generation: u64, item: DeviceItem },
-    Disconnected { generation: u64 },
-    Snapshot { camera: String, tracked: bool, result: Result<u64, String> },
+    Connected {
+        generation: u64,
+        client: Arc<Protect>,
+        version: String,
+        cameras: Vec<Camera>,
+    },
+    Cameras {
+        generation: u64,
+        cameras: Vec<Camera>,
+    },
+    Event {
+        generation: u64,
+        action: String,
+        item: EventItem,
+    },
+    CameraPatch {
+        generation: u64,
+        item: DeviceItem,
+    },
+    Disconnected {
+        generation: u64,
+    },
+    Snapshot {
+        camera: String,
+        tracked: bool,
+        result: Result<u64, String>,
+    },
     /// The system resumed from suspend: every connection is suspect.
     Resumed,
     /// The routing table changed (and then settled): the active address may be wrong now.
@@ -86,6 +111,7 @@ struct CamView {
     kinds: Vec<String>,
 }
 
+#[derive(Clone)]
 struct OpenEvent {
     camera: String,
     event_type: String,
@@ -107,6 +133,174 @@ impl Filter {
 
     fn matches(&self, camera: &str, kinds: &[String]) -> bool {
         self.camera_passes(camera) && kinds.iter().any(|k| self.notify.contains(k))
+    }
+}
+
+/// One `event` line to emit, with the event as it stands after the change.
+struct Change {
+    phase: Phase,
+    id: String,
+    event: OpenEvent,
+    end: Option<i64>,
+    /// Ended by us (disconnect, reload, TTL sweep) rather than by Protect.
+    forced: bool,
+    /// Run the event's actions (notification, snapshot): the filter newly matches it.
+    notify: bool,
+}
+
+impl Change {
+    /// The event-log line for a start or an end (updates are not logged).
+    fn log_line<'a>(&'a self, camera_name: &'a str, filter: &Filter) -> Option<CameraLine<'a>> {
+        if self.phase == Phase::Update {
+            return None;
+        }
+        let event = &self.event;
+        Some(CameraLine {
+            phase: self.phase,
+            id: &self.id,
+            camera: camera_name,
+            camera_id: &event.camera,
+            event_type: &event.event_type,
+            kinds: &event.kinds,
+            matched: Some(filter.matches(&event.camera, &event.kinds)),
+            start: Time(event.start),
+            end: self.end.map(Time),
+            duration_s: self.end.map(|end| event_log::duration_s(event.start, end)),
+            forced: self.forced,
+        })
+    }
+}
+
+/// The console's open events, and the ids of recently ended ones: Protect keeps sending updates
+/// for an event after its end.
+struct Events {
+    open: HashMap<String, OpenEvent>,
+    ended: VecDeque<String>,
+}
+
+impl Events {
+    fn new() -> Self {
+        Self {
+            open: HashMap::new(),
+            ended: VecDeque::with_capacity(ENDED_REMEMBERED),
+        }
+    }
+
+    /// Applies one frame of the events websocket; `known` tells whether a camera is ours.
+    fn apply(
+        &mut self,
+        action: &str,
+        item: EventItem,
+        filter: &Filter,
+        known: impl Fn(&str) -> bool,
+        now: Instant,
+    ) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let Some(id) = item.id else { return changes };
+        if self.ended.contains(&id) {
+            return changes;
+        }
+        if let Some(open) = self.open.get_mut(&id) {
+            if let Some(types) = item.smart_detect_types.as_deref() {
+                let kinds = event_kinds(&open.event_type, Some(types));
+                if kinds != open.kinds {
+                    let old_kinds = std::mem::replace(&mut open.kinds, kinds);
+                    let notify = filter.camera_passes(&open.camera)
+                        && open
+                            .kinds
+                            .iter()
+                            .any(|k| filter.notify.contains(k) && !old_kinds.contains(k));
+                    let event = open.clone();
+                    changes.push(Change {
+                        phase: Phase::Update,
+                        id: id.clone(),
+                        event,
+                        end: None,
+                        forced: false,
+                        notify,
+                    });
+                }
+            }
+            if let Some(end) = item.end {
+                changes.extend(self.end(&id, end, false));
+            }
+            return changes;
+        }
+
+        // Unseen id: an `add`, or a born-closed `update` carrying the complete event.
+        let (Some(event_type), Some(start), Some(camera)) = (item.kind, item.start, item.device)
+        else {
+            return changes;
+        };
+        if action == "update" && item.end.is_none() || !matches!(action, "add" | "update") {
+            return changes;
+        }
+        if !EVENT_TYPES.contains(&event_type.as_str()) || !known(&camera) {
+            return changes;
+        }
+        let kinds = event_kinds(&event_type, item.smart_detect_types.as_deref());
+        let event = OpenEvent {
+            camera,
+            event_type,
+            kinds,
+            start,
+            seen: now,
+        };
+        let notify = filter.matches(&event.camera, &event.kinds);
+        changes.push(Change {
+            phase: Phase::Start,
+            id: id.clone(),
+            event: event.clone(),
+            end: None,
+            forced: false,
+            notify,
+        });
+        self.open.insert(id.clone(), event);
+        if let Some(end) = item.end {
+            changes.extend(self.end(&id, end, false));
+        }
+        changes
+    }
+
+    /// Ends an open event and remembers its id, so later updates for it are ignored.
+    fn end(&mut self, id: &str, end: i64, forced: bool) -> Option<Change> {
+        let event = self.open.remove(id)?;
+        if self.ended.len() == ENDED_REMEMBERED {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(id.to_owned());
+        Some(Change {
+            phase: Phase::End,
+            id: id.to_owned(),
+            event,
+            end: Some(end),
+            forced,
+            notify: false,
+        })
+    }
+
+    /// Ends every open event at `end`, forced (the connection is gone).
+    fn end_all(&mut self, end: i64) -> Vec<Change> {
+        self.force_end_where(end, |_| true)
+    }
+
+    /// Force-ends events first seen more than `EVENT_TTL` before `now` (their end never arrived).
+    fn end_stale(&mut self, now: Instant, end: i64) -> Vec<Change> {
+        self.force_end_where(end, |event| {
+            now.saturating_duration_since(event.seen) > EVENT_TTL
+        })
+    }
+
+    fn force_end_where(&mut self, end: i64, pred: impl Fn(&OpenEvent) -> bool) -> Vec<Change> {
+        let ids: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, event)| pred(event))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.iter()
+            .filter_map(|id| self.end(id, end, true))
+            .collect()
     }
 }
 
@@ -145,8 +339,7 @@ struct Daemon {
     status: (State, Option<String>, Option<String>, Option<String>),
     cameras: HashMap<String, Cam>,
     emitted_cameras: Option<Vec<CamView>>,
-    events: HashMap<String, OpenEvent>,
-    ended: VecDeque<String>,
+    events: Events,
     filter: Filter,
     watch: Option<Interval>,
     in_flight: HashSet<String>,
@@ -197,10 +390,11 @@ pub async fn run() -> Result<()> {
         status: (State::Connecting, None, None, None),
         cameras: HashMap::new(),
         emitted_cameras: None,
-        events: HashMap::new(),
-        ended: VecDeque::with_capacity(ENDED_REMEMBERED),
+        events: Events::new(),
         filter: Filter {
-            notify: ["person", "vehicle", "package", "ring"].map(String::from).to_vec(),
+            notify: ["person", "vehicle", "package", "ring"]
+                .map(String::from)
+                .to_vec(),
             cameras: Vec::new(),
             desktop: true,
         },
@@ -211,7 +405,14 @@ pub async fn run() -> Result<()> {
         event_writer,
     };
 
-    emit(&mut daemon.out, &Msg::Hello { version: env!("CARGO_PKG_VERSION"), protocol: PROTOCOL }).await;
+    emit(
+        &mut daemon.out,
+        &Msg::Hello {
+            version: env!("CARGO_PKG_VERSION"),
+            protocol: PROTOCOL,
+        },
+    )
+    .await;
     daemon.reload(Reload::Startup).await;
     tokio::spawn(watch_resume(tx.clone()));
     tokio::spawn(watch_network(tx));
@@ -257,7 +458,9 @@ async fn create_runtime_dirs(root: &Path, snap: &Path, events: &Path) -> Result<
         .with_context(|| format!("cannot create {}", root.display()))?;
     tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).await?;
     for dir in [snap, events] {
-        tokio::fs::create_dir_all(dir).await.with_context(|| format!("cannot create {}", dir.display()))?;
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("cannot create {}", dir.display()))?;
     }
     Ok(())
 }
@@ -299,7 +502,9 @@ async fn read_stdin(tx: Tx) {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 impl Daemon {
@@ -307,15 +512,25 @@ impl Daemon {
         emit(&mut self.out, &Msg::Log { level, message }).await;
     }
 
-    async fn set_status(&mut self, state: State, message: Option<String>, protect: Option<String>, via: Option<String>) {
+    async fn set_status(
+        &mut self,
+        state: State,
+        message: Option<String>,
+        protect: Option<String>,
+        via: Option<String>,
+    ) {
         let status = (state, message, protect, via);
         if status == self.status {
             return;
         }
         self.status = status;
         let (state, message, protect, via) = &self.status;
-        let msg =
-            Msg::Status { state: *state, message: message.as_deref(), protect: protect.as_deref(), via: via.as_deref() };
+        let msg = Msg::Status {
+            state: *state,
+            message: message.as_deref(),
+            protect: protect.as_deref(),
+            via: via.as_deref(),
+        };
         emit(&mut self.out, &msg).await;
     }
 
@@ -342,20 +557,35 @@ impl Daemon {
             Some(connection) if why == Reload::Resume => Ok(connection.config),
             _ => {
                 self.config_mtime = config_mtime(&self.config_path).await;
-                config::load(&self.config_path).await.map_err(|err| err.to_string())
+                config::load(&self.config_path)
+                    .await
+                    .map_err(|err| err.to_string())
             }
         };
         match config {
             Ok(config) => {
                 self.set_status(State::Connecting, None, None, None).await;
                 self.event_log = config.event_log.as_deref().map(Arc::from);
-                let warmer = (!config.username.is_empty()).then(|| Arc::new(Warmer::new(config.username.clone())));
+                let warmer = (!config.username.is_empty())
+                    .then(|| Arc::new(Warmer::new(config.username.clone())));
                 let (network, network_rx) = mpsc::unbounded_channel();
-                let task = tokio::spawn(run_session(self.generation, config.clone(), self.tx.clone(), network_rx));
-                self.connection = Some(Connection { config, client: None, warmer, network, task });
+                let task = tokio::spawn(run_session(
+                    self.generation,
+                    config.clone(),
+                    self.tx.clone(),
+                    network_rx,
+                ));
+                self.connection = Some(Connection {
+                    config,
+                    client: None,
+                    warmer,
+                    network,
+                    task,
+                });
             }
             Err(message) => {
-                self.set_status(State::Unconfigured, Some(message), None, None).await;
+                self.set_status(State::Unconfigured, Some(message), None, None)
+                    .await;
                 self.event_log = None;
                 self.cameras.clear();
                 self.emit_cameras().await;
@@ -368,18 +598,31 @@ impl Daemon {
             Internal::Stdin(line) => self.command(&line).await,
             // The parent shell is gone.
             Internal::StdinClosed => std::process::exit(0),
-            Internal::Status { generation, state, message } if generation == self.generation => {
+            Internal::Status {
+                generation,
+                state,
+                message,
+            } if generation == self.generation => {
                 self.set_status(state, Some(message), None, None).await;
             }
-            Internal::Connected { generation, client, version, cameras } if generation == self.generation => {
+            Internal::Connected {
+                generation,
+                client,
+                version,
+                cameras,
+            } if generation == self.generation => {
                 let via = client.via().map(str::to_owned);
                 if let Some(connection) = &mut self.connection {
                     connection.client = Some(client);
                 }
                 self.set_cameras(cameras).await;
-                self.set_status(State::Online, None, Some(version), via).await;
+                self.set_status(State::Online, None, Some(version), via)
+                    .await;
             }
-            Internal::Cameras { generation, cameras } if generation == self.generation => {
+            Internal::Cameras {
+                generation,
+                cameras,
+            } if generation == self.generation => {
                 self.set_cameras(cameras).await;
             }
             Internal::Resumed => self.reload(Reload::Resume).await,
@@ -388,7 +631,11 @@ impl Daemon {
                     let _ = connection.network.send(());
                 }
             }
-            Internal::Event { generation, action, item } if generation == self.generation => {
+            Internal::Event {
+                generation,
+                action,
+                item,
+            } if generation == self.generation => {
                 self.on_event(&action, item).await;
             }
             Internal::CameraPatch { generation, item } if generation == self.generation => {
@@ -400,7 +647,11 @@ impl Daemon {
                 }
                 self.force_end_all().await;
             }
-            Internal::Snapshot { camera, tracked, result } => self.on_snapshot(camera, tracked, result).await,
+            Internal::Snapshot {
+                camera,
+                tracked,
+                result,
+            } => self.on_snapshot(camera, tracked, result).await,
             Internal::Log(level, message) => self.log(level, &message).await,
             // Stale data from a superseded session.
             Internal::Status { .. }
@@ -420,11 +671,20 @@ impl Daemon {
             Ok(command) => command,
             Err(err) => {
                 let text = String::from_utf8_lossy(line.trim_ascii());
-                return self.log(Level::Warn, &format!("ignoring invalid command {text}: {err}")).await;
+                return self
+                    .log(
+                        Level::Warn,
+                        &format!("ignoring invalid command {text}: {err}"),
+                    )
+                    .await;
             }
         };
         match command {
-            Command::Filter { notify, cameras, desktop } => {
+            Command::Filter {
+                notify,
+                cameras,
+                desktop,
+            } => {
                 if let Some(notify) = notify {
                     self.filter.notify = notify;
                 }
@@ -436,8 +696,14 @@ impl Daemon {
                 }
             }
             Command::Watch { on: false, .. } => self.watch = None,
-            Command::Watch { on: true, interval: secs } => {
-                let secs = secs.filter(|s| s.is_finite()).unwrap_or(2.0).clamp(1.0, 60.0);
+            Command::Watch {
+                on: true,
+                interval: secs,
+            } => {
+                let secs = secs
+                    .filter(|s| s.is_finite())
+                    .unwrap_or(2.0)
+                    .clamp(1.0, 60.0);
                 let mut watch = interval(Duration::from_secs_f64(secs));
                 watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 self.watch = Some(watch);
@@ -446,7 +712,8 @@ impl Daemon {
                 if self.cameras.contains_key(&camera) {
                     self.fetch_snapshot(&camera);
                 } else {
-                    self.log(Level::Warn, &format!("snapshot: unknown camera {camera}")).await;
+                    self.log(Level::Warn, &format!("snapshot: unknown camera {camera}"))
+                        .await;
                 }
             }
             Command::Live { camera } => self.live(camera).await,
@@ -460,9 +727,22 @@ impl Daemon {
         let mut previous = std::mem::take(&mut self.cameras);
         for info in cameras {
             let seq = previous.remove(&info.id).map_or(0, |cam| cam.seq);
-            let snapshot = self.shared.snap_dir.join(format!("{}.jpg", info.id)).to_string_lossy().into_owned();
+            let snapshot = self
+                .shared
+                .snap_dir
+                .join(format!("{}.jpg", info.id))
+                .to_string_lossy()
+                .into_owned();
             let kinds = info.kinds();
-            self.cameras.insert(info.id.clone(), Cam { info, kinds, seq, snapshot });
+            self.cameras.insert(
+                info.id.clone(),
+                Cam {
+                    info,
+                    kinds,
+                    seq,
+                    snapshot,
+                },
+            );
         }
         self.emit_cameras().await;
     }
@@ -484,7 +764,9 @@ impl Daemon {
     /// Emits the camera list (sorted by name) if anything but snapshot seqs changed.
     async fn emit_cameras(&mut self) {
         let mut cams: Vec<&Cam> = self.cameras.values().collect();
-        cams.sort_by_cached_key(|cam| (cam.info.display_name().to_lowercase(), cam.info.id.clone()));
+        cams.sort_by_cached_key(|cam| {
+            (cam.info.display_name().to_lowercase(), cam.info.id.clone())
+        });
         let views: Vec<CamView> = cams
             .iter()
             .map(|cam| CamView {
@@ -521,8 +803,12 @@ impl Daemon {
         if !self.online() {
             return;
         }
-        let online: Vec<String> =
-            self.cameras.values().filter(|cam| cam.info.online()).map(|cam| cam.info.id.clone()).collect();
+        let online: Vec<String> = self
+            .cameras
+            .values()
+            .filter(|cam| cam.info.online())
+            .map(|cam| cam.info.id.clone())
+            .collect();
         for camera in online {
             self.fetch_snapshot(&camera);
         }
@@ -530,7 +816,9 @@ impl Daemon {
 
     /// Starts a tracked low-quality refresh unless one is already in flight for the camera.
     fn fetch_snapshot(&mut self, camera: &str) {
-        let Some(client) = self.connection.as_ref().and_then(|c| c.client.clone()) else { return };
+        let Some(client) = self.connection.as_ref().and_then(|c| c.client.clone()) else {
+            return;
+        };
         if !self.in_flight.insert(camera.to_owned()) {
             return;
         }
@@ -538,7 +826,11 @@ impl Daemon {
         tokio::spawn(async move {
             let result = store_snapshot(&shared, &client, &camera, None, &tx, true).await;
             if let Err(err) = result {
-                let _ = tx.send(Internal::Snapshot { camera, tracked: true, result: Err(format!("{err:#}")) });
+                let _ = tx.send(Internal::Snapshot {
+                    camera,
+                    tracked: true,
+                    result: Err(format!("{err:#}")),
+                });
             }
         });
     }
@@ -547,17 +839,32 @@ impl Daemon {
         if tracked {
             self.in_flight.remove(&camera);
         }
-        let name = self.cameras.get(&camera).map_or(camera.as_str(), |cam| cam.info.display_name()).to_owned();
+        let name = self
+            .cameras
+            .get(&camera)
+            .map_or(camera.as_str(), |cam| cam.info.display_name())
+            .to_owned();
         match result {
             Ok(seq) => {
                 self.snapshot_errors.remove(&camera);
-                let Some(cam) = self.cameras.get_mut(&camera) else { return };
+                let Some(cam) = self.cameras.get_mut(&camera) else {
+                    return;
+                };
                 cam.seq = seq;
-                emit(&mut self.out, &Msg::Snapshot { camera: &camera, seq, path: &cam.snapshot }).await;
+                emit(
+                    &mut self.out,
+                    &Msg::Snapshot {
+                        camera: &camera,
+                        seq,
+                        path: &cam.snapshot,
+                    },
+                )
+                .await;
             }
             Err(err) => {
                 if self.snapshot_errors.get(&camera) != Some(&err) {
-                    self.log(Level::Warn, &format!("snapshot {name}: {err}")).await;
+                    self.log(Level::Warn, &format!("snapshot {name}: {err}"))
+                        .await;
                     self.snapshot_errors.insert(camera, err);
                 }
             }
@@ -567,122 +874,67 @@ impl Daemon {
     // ---- events --------------------------------------------------------------------------
 
     async fn on_event(&mut self, action: &str, item: EventItem) {
-        let Some(id) = item.id else { return };
-        if self.ended.contains(&id) {
-            return;
-        }
-        if let Some(open) = self.events.get_mut(&id) {
-            let old_kinds = match item.smart_detect_types.as_deref() {
-                Some(types) => {
-                    let kinds = event_kinds(&open.event_type, Some(types));
-                    (kinds != open.kinds).then(|| std::mem::replace(&mut open.kinds, kinds))
-                }
-                None => None,
+        let cameras = &self.cameras;
+        let changes = self.events.apply(
+            action,
+            item,
+            &self.filter,
+            |camera| cameras.contains_key(camera),
+            Instant::now(),
+        );
+        self.publish(changes).await;
+    }
+
+    /// Emits an `event` line per change, appends starts and ends to the event log, and starts the
+    /// actions of events the filter newly matches.
+    async fn publish(&mut self, changes: Vec<Change>) {
+        for change in changes {
+            let event = &change.event;
+            let msg = Msg::Event {
+                phase: change.phase,
+                id: &change.id,
+                camera: &event.camera,
+                event_type: &event.event_type,
+                kinds: &event.kinds,
+                matched: self.filter.matches(&event.camera, &event.kinds),
+                start: event.start,
+                end: change.end,
             };
-            if let Some(old_kinds) = old_kinds {
-                self.emit_event(Phase::Update, &id, None).await;
-                let open = &self.events[&id];
-                let grew = self.filter.camera_passes(&open.camera)
-                    && open.kinds.iter().any(|k| self.filter.notify.contains(k) && !old_kinds.contains(k));
-                if grew {
-                    self.event_actions(&id);
-                }
+            emit(&mut self.out, &msg).await;
+            if let Some(path) = &self.event_log
+                && let Some(line) = change.log_line(self.camera_name(&event.camera), &self.filter)
+            {
+                self.event_writer.write(path, &line);
             }
-            if let Some(end) = item.end {
-                self.end_event(&id, end, false).await;
+            if change.notify {
+                self.event_actions(&change.id, event);
             }
-            return;
         }
-
-        // Unseen id: an `add`, or a born-closed `update` carrying the complete event.
-        let (Some(event_type), Some(start), Some(camera)) = (item.kind, item.start, item.device) else { return };
-        if action == "update" && item.end.is_none() || !matches!(action, "add" | "update") {
-            return;
-        }
-        if !EVENT_TYPES.contains(&event_type.as_str()) || !self.cameras.contains_key(&camera) {
-            return;
-        }
-        let kinds = event_kinds(&event_type, item.smart_detect_types.as_deref());
-        self.events.insert(id.clone(), OpenEvent { camera, event_type, kinds, start, seen: Instant::now() });
-        self.emit_event(Phase::Start, &id, None).await;
-        self.log_event(Phase::Start, &id, None, false);
-        let open = &self.events[&id];
-        if self.filter.matches(&open.camera, &open.kinds) {
-            self.event_actions(&id);
-        }
-        if let Some(end) = item.end {
-            self.end_event(&id, end, false).await;
-        }
-    }
-
-    async fn emit_event(&mut self, phase: Phase, id: &str, end: Option<i64>) {
-        let Some(open) = self.events.get(id) else { return };
-        let msg = Msg::Event {
-            phase,
-            id,
-            camera: &open.camera,
-            event_type: &open.event_type,
-            kinds: &open.kinds,
-            matched: self.filter.matches(&open.camera, &open.kinds),
-            start: open.start,
-            end,
-        };
-        emit(&mut self.out, &msg).await;
-    }
-
-    /// Appends a `start` or `end` line to the event log, if one is configured.
-    fn log_event(&self, phase: Phase, id: &str, end: Option<i64>, forced: bool) {
-        let (Some(path), Some(open)) = (&self.event_log, self.events.get(id)) else { return };
-        let line = CameraLine {
-            phase,
-            id,
-            camera: self.camera_name(&open.camera),
-            camera_id: &open.camera,
-            event_type: &open.event_type,
-            kinds: &open.kinds,
-            matched: Some(self.filter.matches(&open.camera, &open.kinds)),
-            start: Time(open.start),
-            end: end.map(Time),
-            duration_s: end.map(|end| event_log::duration_s(open.start, end)),
-            forced,
-        };
-        self.event_writer.write(path, &line);
-    }
-
-    /// `forced`: ended by us (disconnect, reload, TTL sweep) rather than by Protect.
-    async fn end_event(&mut self, id: &str, end: i64, forced: bool) {
-        self.emit_event(Phase::End, id, Some(end)).await;
-        self.log_event(Phase::End, id, Some(end), forced);
-        self.events.remove(id);
-        if self.ended.len() == ENDED_REMEMBERED {
-            self.ended.pop_front();
-        }
-        self.ended.push_back(id.to_owned());
     }
 
     async fn force_end_all(&mut self) {
-        let ids: Vec<String> = self.events.keys().cloned().collect();
-        let now = now_ms();
-        for id in ids {
-            self.end_event(&id, now, true).await;
-        }
+        let changes = self.events.end_all(now_ms());
+        self.publish(changes).await;
     }
 
     async fn sweep(&mut self) {
-        let stale: Vec<String> =
-            self.events.iter().filter(|(_, e)| e.seen.elapsed() > EVENT_TTL).map(|(id, _)| id.clone()).collect();
-        let now = now_ms();
-        for id in stale {
-            self.end_event(&id, now, true).await;
-        }
+        let changes = self.events.end_stale(Instant::now(), now_ms());
+        self.publish(changes).await;
     }
 
     /// Desktop notification first, then the snapshot and the notification again with the image;
     /// runs detached so the `event` line is never delayed.
-    fn event_actions(&self, id: &str) {
-        let (Some(connection), Some(open)) = (&self.connection, self.events.get(id)) else { return };
-        let Some(client) = connection.client.clone() else { return };
-        let camera_name = self.cameras.get(&open.camera).map_or(open.camera.as_str(), |c| c.info.display_name());
+    fn event_actions(&self, id: &str, open: &OpenEvent) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let Some(client) = connection.client.clone() else {
+            return;
+        };
+        let camera_name = self
+            .cameras
+            .get(&open.camera)
+            .map_or(open.camera.as_str(), |c| c.info.display_name());
         let job = EventJob {
             event_id: id.to_owned(),
             camera: open.camera.clone(),
@@ -691,23 +943,39 @@ impl Daemon {
             start: open.start,
             desktop: self.filter.desktop,
         };
-        let (shared, warmer, tx) = (self.shared.clone(), connection.warmer.clone(), self.tx.clone());
+        let (shared, warmer, tx) = (
+            self.shared.clone(),
+            connection.warmer.clone(),
+            self.tx.clone(),
+        );
         tokio::spawn(run_event_job(shared, client, warmer, tx, job));
     }
 
     // ---- live ----------------------------------------------------------------------------
 
     async fn live_result(&mut self, camera: &str, ok: bool, message: Option<&str>) {
-        emit(&mut self.out, &Msg::Live { camera, ok, message }).await;
+        emit(
+            &mut self.out,
+            &Msg::Live {
+                camera,
+                ok,
+                message,
+            },
+        )
+        .await;
     }
 
     /// Runs `sauron live <camera>` detached: it focuses an open viewer or starts one.
     async fn live(&mut self, camera: String) {
         if self.connection.is_none() {
-            return self.live_result(&camera, false, Some("Not set up yet: run sauron setup")).await;
+            return self
+                .live_result(&camera, false, Some("Not set up yet: run sauron setup"))
+                .await;
         }
         if !self.cameras.contains_key(&camera) {
-            return self.live_result(&camera, false, Some("unknown camera")).await;
+            return self
+                .live_result(&camera, false, Some("unknown camera"))
+                .await;
         }
         let spawned = tokio::process::Command::new(&self.exe)
             .arg("live")
@@ -724,10 +992,16 @@ impl Daemon {
                     match viewer.wait().await {
                         Ok(status) if status.success() => {}
                         Ok(status) => {
-                            let _ = tx.send(Internal::Log(Level::Warn, format!("live view of {name}: {status}")));
+                            let _ = tx.send(Internal::Log(
+                                Level::Warn,
+                                format!("live view of {name}: {status}"),
+                            ));
                         }
                         Err(err) => {
-                            let _ = tx.send(Internal::Log(Level::Warn, format!("live view of {name}: {err}")));
+                            let _ = tx.send(Internal::Log(
+                                Level::Warn,
+                                format!("live view of {name}: {err}"),
+                            ));
                         }
                     }
                 });
@@ -741,7 +1015,9 @@ impl Daemon {
     }
 
     fn camera_name<'a>(&'a self, camera: &'a str) -> &'a str {
-        self.cameras.get(camera).map_or(camera, |cam| cam.info.display_name())
+        self.cameras
+            .get(camera)
+            .map_or(camera, |cam| cam.info.display_name())
     }
 }
 
@@ -756,7 +1032,13 @@ struct EventJob {
     desktop: bool,
 }
 
-async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, warmer: Option<Arc<Warmer>>, tx: Tx, job: EventJob) {
+async fn run_event_job(
+    shared: Arc<Shared>,
+    client: Arc<Protect>,
+    warmer: Option<Arc<Warmer>>,
+    tx: Tx,
+    job: EventJob,
+) {
     let notify = |image: Option<PathBuf>| {
         let (shared, tx, job) = (&shared, &tx, &job);
         async move {
@@ -777,22 +1059,39 @@ async fn run_event_job(shared: Arc<Shared>, client: Arc<Protect>, warmer: Option
         if job.desktop {
             // An update (kinds grew) keeps the image the earlier notification already shows.
             let previous = shared.events_dir.join(format!("{}.jpg", job.event_id));
-            let image = tokio::fs::try_exists(&previous).await.unwrap_or(false).then_some(previous);
+            let image = tokio::fs::try_exists(&previous)
+                .await
+                .unwrap_or(false)
+                .then_some(previous);
             notify(image).await;
         }
     };
-    let snapshot = store_snapshot(&shared, &client, &job.camera, Some(&job.event_id), &tx, false);
+    let snapshot = store_snapshot(
+        &shared,
+        &client,
+        &job.camera,
+        Some(&job.event_id),
+        &tx,
+        false,
+    );
     let ((), image) = tokio::join!(first, snapshot);
     let image = match image {
         Ok(path) => {
             if let Err(err) = prune_event_images(&shared.events_dir).await {
-                let _ = tx.send(Internal::Log(Level::Error, format!("pruning event images: {err:#}")));
+                let _ = tx.send(Internal::Log(
+                    Level::Error,
+                    format!("pruning event images: {err:#}"),
+                ));
             }
             path
         }
         Err(err) => {
             let result = Err(format!("{err:#}"));
-            let _ = tx.send(Internal::Snapshot { camera: job.camera.clone(), tracked: false, result });
+            let _ = tx.send(Internal::Snapshot {
+                camera: job.camera.clone(),
+                tracked: false,
+                result,
+            });
             None
         }
     };
@@ -820,7 +1119,12 @@ async fn store_snapshot(
     tx: &Tx,
     tracked: bool,
 ) -> Result<Option<PathBuf>> {
-    let is_safe = |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let is_safe = |id: &str| {
+        !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
     if !is_safe(camera) || !event.is_none_or(is_safe) {
         bail!("refusing unsafe id in file name");
     }
@@ -837,15 +1141,23 @@ async fn store_snapshot(
         None => None,
     };
     let seq = shared.seq.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = tx.send(Internal::Snapshot { camera: camera.to_owned(), tracked, result: Ok(seq) });
+    let _ = tx.send(Internal::Snapshot {
+        camera: camera.to_owned(),
+        tracked,
+        result: Ok(seq),
+    });
     Ok(event_image)
 }
 
 async fn write_atomic(path: &Path, data: &Bytes) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    tokio::fs::write(&tmp, data).await.with_context(|| format!("cannot write {}", path.display()))?;
-    tokio::fs::rename(&tmp, path).await.with_context(|| format!("cannot replace {}", path.display()))?;
+    tokio::fs::write(&tmp, data)
+        .await
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
 }
 
@@ -878,7 +1190,12 @@ async fn prune_event_images(dir: &Path) -> Result<()> {
 /// Connects to the first address of the console that answers, streams both websockets, and
 /// reconnects with backoff until aborted. A network change (on `network`) cuts a backoff short,
 /// and while online checks whether the active address is still the right one.
-async fn run_session(generation: u64, config: Config, tx: Tx, mut network: mpsc::UnboundedReceiver<()>) {
+async fn run_session(
+    generation: u64,
+    config: Config,
+    tx: Tx,
+    mut network: mpsc::UnboundedReceiver<()>,
+) {
     let config = Arc::new(config);
     let mut backoff = BACKOFF_MIN;
     // The last failure logged in full, so a console that stays away doesn't flood the log.
@@ -887,7 +1204,16 @@ async fn run_session(generation: u64, config: Config, tx: Tx, mut network: mpsc:
         let (state, message) = match protect::connect(&config).await {
             Ok((client, version)) => {
                 let client = Arc::new(client);
-                let ended = session_once(generation, &config, &client, version, &tx, &mut network, &mut backoff).await;
+                let ended = session_once(
+                    generation,
+                    &config,
+                    &client,
+                    version,
+                    &tx,
+                    &mut network,
+                    &mut backoff,
+                )
+                .await;
                 let _ = tx.send(Internal::Disconnected { generation });
                 let err = match ended {
                     // A network change: reconnect right away, trying `host` first again.
@@ -902,7 +1228,10 @@ async fn run_session(generation: u64, config: Config, tx: Tx, mut network: mpsc:
                 if protect::is_auth(&err) {
                     (State::Auth, format!("{err:#}"))
                 } else {
-                    (State::Offline, protect::failure_message(client.address(), &err))
+                    (
+                        State::Offline,
+                        protect::failure_message(client.address(), &err),
+                    )
                 }
             }
             Err(err) => {
@@ -929,7 +1258,11 @@ async fn run_session(generation: u64, config: Config, tx: Tx, mut network: mpsc:
             backoff = (backoff * 2).min(BACKOFF_MAX);
             wait
         };
-        let _ = tx.send(Internal::Status { generation, state, message });
+        let _ = tx.send(Internal::Status {
+            generation,
+            state,
+            message,
+        });
         tokio::select! {
             () = sleep(wait) => {}
             Some(()) = network.recv() => {
@@ -951,11 +1284,17 @@ async fn session_once(
     backoff: &mut Duration,
 ) -> Result<()> {
     let cameras = client.cameras().await?;
-    let (mut events, mut devices) = tokio::try_join!(client.subscribe("events"), client.subscribe("devices"))?;
+    let (mut events, mut devices) =
+        tokio::try_join!(client.subscribe("events"), client.subscribe("devices"))?;
 
     let mut background = JoinSet::new();
     let mut checks = JoinSet::new();
-    let _ = tx.send(Internal::Connected { generation, client: client.clone(), version, cameras });
+    let _ = tx.send(Internal::Connected {
+        generation,
+        client: client.clone(),
+        version,
+        cameras,
+    });
     *backoff = BACKOFF_MIN;
 
     let mut ping = tokio::time::interval_at(Instant::now() + PING_EVERY, PING_EVERY);
@@ -1032,16 +1371,25 @@ fn text_frame(
 }
 
 async fn ping_socket(topic: &str, socket: &mut WsStream) -> Result<()> {
-    socket.send(Message::Ping(Bytes::new())).await.map_err(|err| anyhow!("{topic} websocket: {err}"))
+    socket
+        .send(Message::Ping(Bytes::new()))
+        .await
+        .map_err(|err| anyhow!("{topic} websocket: {err}"))
 }
 
 async fn refetch_cameras(generation: u64, client: Arc<Protect>, tx: Tx) {
     match client.cameras().await {
         Ok(cameras) => {
-            let _ = tx.send(Internal::Cameras { generation, cameras });
+            let _ = tx.send(Internal::Cameras {
+                generation,
+                cameras,
+            });
         }
         Err(err) => {
-            let _ = tx.send(Internal::Log(Level::Warn, format!("refreshing cameras: {err:#}")));
+            let _ = tx.send(Internal::Log(
+                Level::Warn,
+                format!("refreshing cameras: {err:#}"),
+            ));
         }
     }
 }
@@ -1050,7 +1398,10 @@ async fn refetch_cameras(generation: u64, client: Arc<Protect>, tx: Tx) {
 /// `NETWORK_SETTLE`, from an `ip -o monitor route` child. Without `ip`, logs one warning.
 async fn watch_network(tx: Tx) {
     if let Err(err) = watch_network_inner(&tx).await {
-        let _ = tx.send(Internal::Log(Level::Warn, format!("cannot watch for network changes: {err:#}")));
+        let _ = tx.send(Internal::Log(
+            Level::Warn,
+            format!("cannot watch for network changes: {err:#}"),
+        ));
     }
 }
 
@@ -1095,7 +1446,10 @@ async fn watch_network_inner(tx: &Tx) -> Result<()> {
 /// Reports `Resumed` after each suspend: logind's `PrepareForSleep(false)` on the system bus.
 async fn watch_resume(tx: Tx) {
     if let Err(err) = watch_resume_inner(&tx).await {
-        let _ = tx.send(Internal::Log(Level::Warn, format!("cannot watch for resume from suspend: {err:#}")));
+        let _ = tx.send(Internal::Log(
+            Level::Warn,
+            format!("cannot watch for resume from suspend: {err:#}"),
+        ));
     }
 }
 
@@ -1117,4 +1471,385 @@ async fn watch_resume_inner(tx: &Tx) -> Result<()> {
         }
     }
     bail!("system bus connection closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|&s| s.to_owned()).collect()
+    }
+
+    fn filter(cameras: &[&str]) -> Filter {
+        Filter {
+            notify: strings(&["person", "ring"]),
+            cameras: strings(cameras),
+            desktop: true,
+        }
+    }
+
+    fn item(id: &str) -> EventItem {
+        EventItem {
+            id: Some(id.into()),
+            ..EventItem::default()
+        }
+    }
+
+    /// A complete event as `add` (or a born-closed `update`) carries it.
+    fn full(id: &str, event_type: &str, camera: &str, types: &[&str]) -> EventItem {
+        EventItem {
+            kind: Some(event_type.into()),
+            start: Some(1_000),
+            device: Some(camera.into()),
+            smart_detect_types: Some(strings(types)),
+            ..item(id)
+        }
+    }
+
+    fn with_types(id: &str, types: &[&str]) -> EventItem {
+        EventItem {
+            smart_detect_types: Some(strings(types)),
+            ..item(id)
+        }
+    }
+
+    fn ended(item: EventItem, end: i64) -> EventItem {
+        EventItem {
+            end: Some(end),
+            ..item
+        }
+    }
+
+    /// (phase, id, kinds, end, forced, notify) of one change.
+    type Line = (Phase, String, Vec<String>, Option<i64>, bool, bool);
+    const NOTHING: Vec<Line> = Vec::new();
+
+    fn line(
+        phase: Phase,
+        id: &str,
+        kinds: &[&str],
+        end: Option<i64>,
+        forced: bool,
+        notify: bool,
+    ) -> Line {
+        (phase, id.into(), strings(kinds), end, forced, notify)
+    }
+
+    fn lines(changes: Vec<Change>) -> Vec<Line> {
+        changes
+            .into_iter()
+            .map(|c| (c.phase, c.id, c.event.kinds, c.end, c.forced, c.notify))
+            .collect()
+    }
+
+    struct Harness {
+        events: Events,
+        filter: Filter,
+        now: Instant,
+    }
+
+    impl Harness {
+        fn new(filter: Filter) -> Self {
+            Self {
+                events: Events::new(),
+                filter,
+                now: Instant::now(),
+            }
+        }
+
+        fn changes(&mut self, action: &str, item: EventItem) -> Vec<Change> {
+            let known = |camera: &str| ["cam1", "cam2"].contains(&camera);
+            self.events
+                .apply(action, item, &self.filter, known, self.now)
+        }
+
+        fn send(&mut self, action: &str, item: EventItem) -> Vec<Line> {
+            lines(self.changes(action, item))
+        }
+    }
+
+    #[test]
+    fn add_starts_and_update_with_end_ends() {
+        let mut h = Harness::new(filter(&[]));
+        let start = h.send("add", full("e1", "smartDetectZone", "cam1", &["person"]));
+        assert_eq!(
+            start,
+            [line(Phase::Start, "e1", &["person"], None, false, true)]
+        );
+        assert_eq!(h.send("update", item("e1")), NOTHING);
+        let end = h.send("update", ended(item("e1"), 2_000));
+        assert_eq!(
+            end,
+            [line(
+                Phase::End,
+                "e1",
+                &["person"],
+                Some(2_000),
+                false,
+                false
+            )]
+        );
+        assert!(h.events.open.is_empty());
+    }
+
+    #[test]
+    fn partial_update_merges_into_the_open_event() {
+        let mut h = Harness::new(filter(&[]));
+        let start = h.send("add", full("e1", "smartDetectZone", "cam1", &["vehicle"]));
+        assert_eq!(
+            start,
+            [line(Phase::Start, "e1", &["vehicle"], None, false, false)]
+        );
+
+        // A partial update (no type, camera or start) keeps those from the add; person is new.
+        let changes = h.changes("update", with_types("e1", &["vehicle", "person"]));
+        let [change] = changes.as_slice() else {
+            panic!("expected one change")
+        };
+        assert_eq!((change.phase, change.notify), (Phase::Update, true));
+        let event = &change.event;
+        assert_eq!(
+            (
+                event.camera.as_str(),
+                event.event_type.as_str(),
+                event.start
+            ),
+            ("cam1", "smartDetectZone", 1_000)
+        );
+        assert_eq!(event.kinds, ["vehicle", "person"]);
+
+        // Same kinds again: nothing to say. More kinds, none newly matching: update, no notification.
+        assert_eq!(
+            h.send("update", with_types("e1", &["vehicle", "person"])),
+            NOTHING
+        );
+        let grew = h.send("update", with_types("e1", &["vehicle", "person", "animal"]));
+        assert_eq!(
+            grew,
+            [line(
+                Phase::Update,
+                "e1",
+                &["vehicle", "person", "animal"],
+                None,
+                false,
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn complete_event_for_an_unseen_id_starts_and_ends() {
+        for (action, id) in [("add", "e1"), ("update", "e2")] {
+            let mut h = Harness::new(filter(&[]));
+            let lines = h.send(action, ended(full(id, "ring", "cam2", &[]), 3_000));
+            let expected = [
+                line(Phase::Start, id, &["ring"], None, false, true),
+                line(Phase::End, id, &["ring"], Some(3_000), false, false),
+            ];
+            assert_eq!(lines, expected, "{action}");
+            assert!(h.events.open.is_empty(), "{action}");
+        }
+    }
+
+    #[test]
+    fn frames_after_the_end_are_ignored() {
+        let mut h = Harness::new(filter(&[]));
+        h.send("add", full("e1", "smartDetectZone", "cam1", &["vehicle"]));
+        h.send("update", ended(item("e1"), 2_000));
+        assert_eq!(
+            h.send("update", with_types("e1", &["vehicle", "person"])),
+            NOTHING
+        );
+        assert_eq!(h.send("update", ended(item("e1"), 2_500)), NOTHING);
+        assert_eq!(
+            h.send("add", full("e1", "smartDetectZone", "cam1", &["person"])),
+            NOTHING
+        );
+    }
+
+    #[test]
+    fn frames_that_cannot_start_an_event_are_dropped() {
+        let mut h = Harness::new(filter(&[]));
+        let frames = [
+            // An open event can only start from an `add`: a lone `update` may be partial.
+            ("update", full("e0", "smartDetectZone", "cam1", &["person"])),
+            ("add", full("e1", "smartDetectZone", "cam9", &["person"])),
+            ("add", full("e2", "sensorOpened", "cam1", &[])),
+            ("remove", ended(full("e3", "motion", "cam1", &[]), 2_000)),
+            (
+                "add",
+                EventItem {
+                    id: None,
+                    ..full("e4", "motion", "cam1", &[])
+                },
+            ),
+            (
+                "add",
+                EventItem {
+                    start: None,
+                    ..full("e5", "motion", "cam1", &[])
+                },
+            ),
+        ];
+        for (action, item) in frames {
+            assert_eq!(h.send(action, item), NOTHING);
+        }
+        assert!(h.events.open.is_empty());
+    }
+
+    #[test]
+    fn notifications_follow_the_filter() {
+        let only_cam2 = filter(&["cam2"]);
+        let kinds = strings(&["vehicle", "person"]);
+        assert!(only_cam2.matches("cam2", &kinds));
+        assert!(!only_cam2.matches("cam1", &kinds));
+        assert!(!only_cam2.matches("cam2", &strings(&["vehicle", "motion"])));
+        assert!(filter(&[]).matches("cam1", &kinds));
+
+        let mut h = Harness::new(only_cam2);
+        assert!(!h.send("add", full("e1", "smartDetectZone", "cam1", &["person"]))[0].5);
+        assert!(h.send("add", full("e2", "ring", "cam2", &[]))[0].5);
+        h.send("add", full("e3", "smartDetectZone", "cam1", &["vehicle"]));
+        assert!(!h.send("update", with_types("e3", &["vehicle", "person"]))[0].5);
+    }
+
+    #[test]
+    fn ended_ids_are_remembered_up_to_a_bound() {
+        let mut h = Harness::new(filter(&[]));
+        for i in 0..=ENDED_REMEMBERED {
+            h.send(
+                "add",
+                ended(full(&format!("e{i}"), "motion", "cam1", &[]), 2_000),
+            );
+        }
+        assert_eq!(h.events.ended.len(), ENDED_REMEMBERED);
+        let newest = format!("e{ENDED_REMEMBERED}");
+        assert_eq!(h.send("add", full(&newest, "motion", "cam1", &[])), NOTHING);
+        assert_eq!(h.send("add", full("e1", "motion", "cam1", &[])), NOTHING);
+        assert_eq!(h.send("add", full("e0", "motion", "cam1", &[])).len(), 1);
+    }
+
+    #[test]
+    fn stale_events_and_disconnects_force_the_end() {
+        let mut h = Harness::new(filter(&[]));
+        let t0 = h.now;
+        h.send("add", full("old", "motion", "cam1", &[]));
+        h.now = t0 + EVENT_TTL;
+        h.send("add", full("new", "motion", "cam2", &[]));
+
+        let stale = lines(
+            h.events
+                .end_stale(t0 + EVENT_TTL + Duration::from_secs(1), 5_000),
+        );
+        assert_eq!(
+            stale,
+            [line(
+                Phase::End,
+                "old",
+                &["motion"],
+                Some(5_000),
+                true,
+                false
+            )]
+        );
+        let rest = lines(h.events.end_all(6_000));
+        assert_eq!(
+            rest,
+            [line(
+                Phase::End,
+                "new",
+                &["motion"],
+                Some(6_000),
+                true,
+                false
+            )]
+        );
+        assert!(h.events.open.is_empty());
+        assert_eq!(h.send("update", ended(item("old"), 7_000)), NOTHING);
+    }
+
+    #[test]
+    fn event_log_lines_cover_starts_and_ends_only() {
+        let mut h = Harness::new(filter(&["cam2"]));
+        let mut changes = h.changes("add", full("e1", "smartDetectZone", "cam1", &["vehicle"]));
+        changes.extend(h.changes("update", with_types("e1", &["vehicle", "person"])));
+        changes.extend(h.changes("update", ended(item("e1"), 3_449)));
+        changes.extend(h.changes("add", full("e2", "ring", "cam2", &[])));
+        changes.extend(h.events.end_all(9_000));
+
+        let logged: Vec<_> = changes
+            .iter()
+            .filter_map(|change| change.log_line("Porch", &h.filter))
+            .map(|l| {
+                (
+                    l.phase,
+                    l.id,
+                    l.camera,
+                    l.camera_id,
+                    l.kinds.to_vec(),
+                    l.matched,
+                    l.start.0,
+                    l.end.map(|t| t.0),
+                    l.duration_s,
+                    l.forced,
+                )
+            })
+            .collect();
+        let kinds = strings(&["vehicle", "person"]);
+        assert_eq!(
+            logged,
+            [
+                (
+                    Phase::Start,
+                    "e1",
+                    "Porch",
+                    "cam1",
+                    strings(&["vehicle"]),
+                    Some(false),
+                    1_000,
+                    None,
+                    None,
+                    false
+                ),
+                // Not matched: person is filtered out on cam1.
+                (
+                    Phase::End,
+                    "e1",
+                    "Porch",
+                    "cam1",
+                    kinds,
+                    Some(false),
+                    1_000,
+                    Some(3_449),
+                    Some(2.4),
+                    false
+                ),
+                (
+                    Phase::Start,
+                    "e2",
+                    "Porch",
+                    "cam2",
+                    strings(&["ring"]),
+                    Some(true),
+                    1_000,
+                    None,
+                    None,
+                    false
+                ),
+                (
+                    Phase::End,
+                    "e2",
+                    "Porch",
+                    "cam2",
+                    strings(&["ring"]),
+                    Some(true),
+                    1_000,
+                    Some(9_000),
+                    Some(8.0),
+                    true
+                ),
+            ]
+        );
+    }
 }

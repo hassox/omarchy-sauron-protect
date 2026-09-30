@@ -53,21 +53,32 @@ pub enum LoginError {
     MfaRequired,
     RateLimited(Option<Duration>),
     /// A recent automatic login failed; not retrying yet.
-    Paused { reason: String, remaining: Duration },
+    Paused {
+        reason: String,
+        remaining: Duration,
+    },
     Other(anyhow::Error),
 }
 
 impl fmt::Display for LoginError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoginError::BadCredentials => f.write_str("the console rejected the username or password"),
+            LoginError::BadCredentials => {
+                f.write_str("the console rejected the username or password")
+            }
             LoginError::MfaRequired => {
                 f.write_str("the account requires MFA; use a local-only UniFi user without MFA")
             }
             LoginError::RateLimited(Some(wait)) => {
-                write!(f, "too many login attempts; the console asks to wait {}s", wait.as_secs())
+                write!(
+                    f,
+                    "too many login attempts; the console asks to wait {}s",
+                    wait.as_secs()
+                )
             }
-            LoginError::RateLimited(None) => f.write_str("too many login attempts; try again in a few minutes"),
+            LoginError::RateLimited(None) => {
+                f.write_str("too many login attempts; try again in a few minutes")
+            }
             LoginError::Paused { reason, remaining } => write!(
                 f,
                 "not logging in again for {}s after: {reason} (run sauron setup to retry now)",
@@ -107,7 +118,9 @@ fn pause_path() -> PathBuf {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 async fn read_json<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Option<T> {
@@ -117,12 +130,21 @@ async fn read_json<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Option<T> {
 /// Writes a private (0600) file atomically, creating the runtime dir if needed.
 async fn write_private(path: &PathBuf, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
-        tokio::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).await?;
+        tokio::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .await?;
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    let mut file =
-        tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .await?;
     file.write_all(data).await?;
     drop(file);
     tokio::fs::rename(&tmp, path).await?;
@@ -160,7 +182,13 @@ pub struct PrivateApi<'a> {
 
 impl<'a> PrivateApi<'a> {
     pub fn new(protect: &'a Protect, username: &str, password: String) -> Self {
-        Self { protect, host: protect.console_id().to_owned(), username: username.to_owned(), password, session: None }
+        Self {
+            protect,
+            host: protect.console_id().to_owned(),
+            username: username.to_owned(),
+            password,
+            session: None,
+        }
     }
 
     /// Logs in now, ignoring any pause (an explicit user action), and caches the session.
@@ -176,9 +204,15 @@ impl<'a> PrivateApi<'a> {
             }
             Err(err) => {
                 match &err {
-                    LoginError::BadCredentials | LoginError::MfaRequired => self.pause(LOGIN_FAILURE_PAUSE, &err).await,
+                    LoginError::BadCredentials | LoginError::MfaRequired => {
+                        self.pause(LOGIN_FAILURE_PAUSE, &err).await
+                    }
                     LoginError::RateLimited(wait) => {
-                        self.pause(wait.unwrap_or(RATE_LIMIT_PAUSE).max(Duration::from_secs(1)), &err).await;
+                        self.pause(
+                            wait.unwrap_or(RATE_LIMIT_PAUSE).max(Duration::from_secs(1)),
+                            &err,
+                        )
+                        .await;
                     }
                     LoginError::Paused { .. } | LoginError::Other(_) => {}
                 }
@@ -201,7 +235,9 @@ impl<'a> PrivateApi<'a> {
     }
 
     async fn save(&self, session: &Session) -> Result<()> {
-        write_private(&session_path(), &serde_json::to_vec(session)?).await.context("writing the session cache")
+        write_private(&session_path(), &serde_json::to_vec(session)?)
+            .await
+            .context("writing the session cache")
     }
 
     /// The cached session for this console and user, else a fresh login (unless paused).
@@ -213,7 +249,9 @@ impl<'a> PrivateApi<'a> {
         if self.session.is_none() {
             self.automatic_login().await?;
         }
-        self.session.as_ref().ok_or_else(|| LoginError::Other(anyhow!("no session")))
+        self.session
+            .as_ref()
+            .ok_or_else(|| LoginError::Other(anyhow!("no session")))
     }
 
     /// A login not requested by the user: honours the pause left by an earlier failure.
@@ -224,7 +262,10 @@ impl<'a> PrivateApi<'a> {
             && pause.until_ms > now_ms()
         {
             let remaining = Duration::from_millis(pause.until_ms - now_ms());
-            return Err(LoginError::Paused { reason: pause.reason, remaining });
+            return Err(LoginError::Paused {
+                reason: pause.reason,
+                remaining,
+            });
         }
         self.login().await
     }
@@ -242,13 +283,21 @@ impl<'a> PrivateApi<'a> {
             if let Some(csrf) = csrf {
                 request = request.header("X-CSRF-Token", csrf);
             }
-            async move { request.send().await.map_err(|e| LoginError::Other(anyhow!(error_chain(&e)))) }
+            async move {
+                request
+                    .send()
+                    .await
+                    .map_err(|e| LoginError::Other(anyhow!(error_chain(&e))))
+            }
         };
         let mut response = send(None).await?;
         // Some UniFi OS versions want a CSRF token even for the login; the root page hands one out.
         // Definite answers (bad credentials, MFA, rate limit) are not retried: each failed attempt
         // counts toward the console's lockout.
-        let definite = matches!(response.status().as_u16(), 200..=299 | 401 | 429 | MFA_STATUS);
+        let definite = matches!(
+            response.status().as_u16(),
+            200..=299 | 401 | 429 | MFA_STATUS
+        );
         if !definite && let Some(csrf) = self.root_csrf().await {
             response = send(Some(csrf)).await?;
         }
@@ -264,19 +313,35 @@ impl<'a> PrivateApi<'a> {
         }
         match status {
             StatusCode::UNAUTHORIZED => return Err(LoginError::BadCredentials),
-            StatusCode::TOO_MANY_REQUESTS => return Err(LoginError::RateLimited(retry_after(&headers))),
+            StatusCode::TOO_MANY_REQUESTS => {
+                return Err(LoginError::RateLimited(retry_after(&headers)));
+            }
             status if !status.is_success() => {
                 return Err(LoginError::Other(anyhow!("login failed: HTTP {status}")));
             }
             _ => {}
         }
-        let cookie = session_cookie(&headers)
-            .ok_or_else(|| LoginError::Other(anyhow!("login succeeded but the console sent no session cookie")))?;
-        Ok(Session { host: self.host.clone(), username: self.username.clone(), cookie, csrf: csrf_header(&headers) })
+        let cookie = session_cookie(&headers).ok_or_else(|| {
+            LoginError::Other(anyhow!(
+                "login succeeded but the console sent no session cookie"
+            ))
+        })?;
+        Ok(Session {
+            host: self.host.clone(),
+            username: self.username.clone(),
+            cookie,
+            csrf: csrf_header(&headers),
+        })
     }
 
     async fn root_csrf(&self) -> Option<String> {
-        let response = self.protect.http().get(self.protect.origin()).send().await.ok()?;
+        let response = self
+            .protect
+            .http()
+            .get(self.protect.origin())
+            .send()
+            .await
+            .ok()?;
         csrf_header(response.headers())
     }
 
@@ -286,7 +351,11 @@ impl<'a> PrivateApi<'a> {
         let mut relogged = false;
         loop {
             let session = self.session().await?.clone();
-            let mut request = self.protect.http().get(url.as_str()).header("Cookie", &session.cookie);
+            let mut request = self
+                .protect
+                .http()
+                .get(url.as_str())
+                .header("Cookie", &session.cookie);
             if let Some(csrf) = &session.csrf {
                 request = request.header("X-CSRF-Token", csrf);
             }
@@ -299,16 +368,27 @@ impl<'a> PrivateApi<'a> {
                 self.automatic_login().await?;
                 continue;
             }
-            if let Some(csrf) = response.headers().get("x-updated-csrf-token").and_then(|v| v.to_str().ok())
+            if let Some(csrf) = response
+                .headers()
+                .get("x-updated-csrf-token")
+                .and_then(|v| v.to_str().ok())
                 && session.csrf.as_deref() != Some(csrf)
             {
-                let session = Session { csrf: Some(csrf.to_owned()), ..session };
+                let session = Session {
+                    csrf: Some(csrf.to_owned()),
+                    ..session
+                };
                 let _ = self.save(&session).await;
                 self.session = Some(session);
             }
-            let body = response.bytes().await.map_err(|e| anyhow!(error_chain(&e)))?;
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| anyhow!(error_chain(&e)))?;
             if status == StatusCode::FORBIDDEN {
-                return Err(anyhow!("the UniFi user may not view Protect (give it Protect: View Only)"));
+                return Err(anyhow!(
+                    "the UniFi user may not view Protect (give it Protect: View Only)"
+                ));
             }
             return Ok((status, body));
         }
@@ -338,10 +418,12 @@ impl<'a> PrivateApi<'a> {
         struct Endpoint {
             url: String,
         }
-        let endpoint: Endpoint =
-            serde_json::from_slice(&body).with_context(|| format!("{LIVESTREAM_PATH}: unexpected response"))?;
-        let mut ws = Url::parse(&endpoint.url).with_context(|| format!("invalid livestream URL {:?}", endpoint.url))?;
-        ws.set_host(Some(self.protect.hostname())).context("cannot rewrite the livestream host")?;
+        let endpoint: Endpoint = serde_json::from_slice(&body)
+            .with_context(|| format!("{LIVESTREAM_PATH}: unexpected response"))?;
+        let mut ws = Url::parse(&endpoint.url)
+            .with_context(|| format!("invalid livestream URL {:?}", endpoint.url))?;
+        ws.set_host(Some(self.protect.hostname()))
+            .context("cannot rewrite the livestream host")?;
         Ok(ws.into())
     }
 
@@ -365,10 +447,14 @@ impl<'a> PrivateApi<'a> {
     /// The event's thumbnail JPEG; `None` when Protect has none for it (404).
     pub async fn event_thumbnail(&mut self, id: &str) -> Result<Option<Bytes>> {
         let mut url = Url::parse(&format!("{}{EVENTS_PATH}", self.protect.origin()))?;
-        url.path_segments_mut().map_err(|()| anyhow!("cannot build the thumbnail URL"))?.extend([id, "thumbnail"]);
+        url.path_segments_mut()
+            .map_err(|()| anyhow!("cannot build the thumbnail URL"))?
+            .extend([id, "thumbnail"]);
         match self.get(&url).await? {
             (StatusCode::NOT_FOUND, _) => Ok(None),
-            (status, _) if !status.is_success() => Err(anyhow!("{EVENTS_PATH}/{id}/thumbnail: HTTP {status}")),
+            (status, _) if !status.is_success() => {
+                Err(anyhow!("{EVENTS_PATH}/{id}/thumbnail: HTTP {status}"))
+            }
             (_, body) => Ok(Some(body)),
         }
     }
@@ -399,7 +485,14 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    headers.get(RETRY_AFTER)?.to_str().ok()?.trim().parse().ok().map(Duration::from_secs)
+    headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Keeps a private-API session cached for the daemon, so clicking an alert starts video
@@ -412,19 +505,110 @@ pub struct Warmer {
 
 impl Warmer {
     pub fn new(username: String) -> Self {
-        Self { username, password: OnceCell::new(), busy: Mutex::new(()) }
+        Self {
+            username,
+            password: OnceCell::new(),
+            busy: Mutex::new(()),
+        }
     }
 
     /// Logs in through `client` (the active address) unless a session is cached; quiet when
     /// instant live is unconfigured or paused.
     pub async fn warm(&self, client: &Protect) -> Result<()> {
         let _busy = self.busy.lock().await;
-        let password = self.password.get_or_init(|| keyring::lookup(client.console_id(), &self.username)).await;
-        let Some(password) = password else { return Ok(()) };
+        let password = self
+            .password
+            .get_or_init(|| keyring::lookup(client.console_id(), &self.username))
+            .await;
+        let Some(password) = password else {
+            return Ok(());
+        };
         let mut api = PrivateApi::new(client, &self.username, password.clone());
         match api.session().await {
             Ok(_) | Err(LoginError::Paused { .. }) => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::HeaderValue;
+
+    use super::*;
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for &(name, value) in pairs {
+            headers.append(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn session_cookie_prefers_the_token_without_attributes() {
+        let login = headers(&[
+            ("set-cookie", "theme=dark; Path=/"),
+            (
+                "set-cookie",
+                "TOKEN=eyJ.test.sig; path=/; samesite=none; secure; httponly",
+            ),
+        ]);
+        assert_eq!(
+            session_cookie(&login).as_deref(),
+            Some("TOKEN=eyJ.test.sig")
+        );
+
+        let uos = headers(&[
+            ("set-cookie", "theme=dark"),
+            ("set-cookie", "UOS_TOKEN=abc; Path=/"),
+        ]);
+        assert_eq!(session_cookie(&uos).as_deref(), Some("UOS_TOKEN=abc"));
+
+        let other = headers(&[
+            ("set-cookie", "flag; Path=/"),
+            ("set-cookie", "SESSION=xyz; Path=/"),
+        ]);
+        assert_eq!(session_cookie(&other).as_deref(), Some("SESSION=xyz"));
+        assert_eq!(session_cookie(&headers(&[])), None);
+    }
+
+    #[test]
+    fn csrf_prefers_the_updated_token() {
+        let both = headers(&[("x-csrf-token", "old"), ("x-updated-csrf-token", "new")]);
+        assert_eq!(csrf_header(&both).as_deref(), Some("new"));
+        assert_eq!(
+            csrf_header(&headers(&[("x-csrf-token", "old")])).as_deref(),
+            Some("old")
+        );
+        assert_eq!(csrf_header(&headers(&[])), None);
+    }
+
+    #[test]
+    fn retry_after_takes_seconds_only() {
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", " 120 ")])),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            retry_after(&headers(&[(
+                "retry-after",
+                "Wed, 21 Oct 2026 07:28:00 GMT"
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn quality_maps_to_livestream_channel() {
+        assert_eq!(
+            [
+                channel("high"),
+                channel("medium"),
+                channel("low"),
+                channel("other")
+            ],
+            [0, 1, 2, 0]
+        );
     }
 }

@@ -44,7 +44,9 @@ pub async fn run(query: &str) -> Result<()> {
 /// Focuses the window titled `title` if one is open.
 async fn focus_open_viewer(title: &str) -> Result<bool> {
     let clients = hypr::clients().await?;
-    let Some(window) = clients.iter().find(|c| c.title == title) else { return Ok(false) };
+    let Some(window) = clients.iter().find(|c| c.title == title) else {
+        return Ok(false);
+    };
     hypr::focus(&format!("address:{}", window.address)).await?;
     Ok(true)
 }
@@ -56,11 +58,17 @@ async fn instant(config: &Config, client: &Protect, camera: &Camera, title: &str
         return Ok(false);
     };
     let mut api = PrivateApi::new(client, &config.username, password);
-    let url = api.livestream_url(&camera.id, private_api::channel(&config.live_quality)).await?;
-    let (mut socket, _) =
-        tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, true, Some(client.ws_connector()))
-            .await
-            .map_err(|err| anyhow!("livestream websocket: {err}"))?;
+    let url = api
+        .livestream_url(&camera.id, private_api::channel(&config.live_quality))
+        .await?;
+    let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+        url.as_str(),
+        None,
+        true,
+        Some(client.ws_connector()),
+    )
+    .await
+    .map_err(|err| anyhow!("livestream websocket: {err}"))?;
 
     let mut player = spawn_player(&config.player, title, "-", Stdio::piped())?;
     let mut stdin = player.stdin.take().context("player has no stdin")?;
@@ -75,7 +83,12 @@ async fn instant(config: &Config, client: &Protect, camera: &Camera, title: &str
             frame = tokio::time::timeout(LIVESTREAM_SILENCE, socket.next()) => frame,
         };
         match frame {
-            Err(_) => break Err(anyhow!("livestream silent for {}s", LIVESTREAM_SILENCE.as_secs())),
+            Err(_) => {
+                break Err(anyhow!(
+                    "livestream silent for {}s",
+                    LIVESTREAM_SILENCE.as_secs()
+                ));
+            }
             Ok(None | Some(Ok(Message::Close(_)))) => break Ok(()),
             Ok(Some(Err(err))) => break Err(anyhow!("livestream websocket: {err}")),
             Ok(Some(Ok(Message::Binary(data)))) => {
@@ -100,7 +113,9 @@ async fn instant(config: &Config, client: &Protect, camera: &Camera, title: &str
             focus.abort();
         }
         let _ = player.kill().await;
-        return Err(ended.err().unwrap_or_else(|| anyhow!("livestream closed before any video arrived")));
+        return Err(ended
+            .err()
+            .unwrap_or_else(|| anyhow!("livestream closed before any video arrived")));
     }
     if let Err(err) = ended {
         eprintln!("sauron: {err:#}");
@@ -115,11 +130,19 @@ async fn rtsps(config: &Config, client: &Protect, camera: &Camera, title: &str) 
     let url = client
         .stream_url(&camera.id, &config.live_quality)
         .await
-        .with_context(|| format!("cannot get {} stream for {}", config.live_quality, camera.display_name()))?;
+        .with_context(|| {
+            format!(
+                "cannot get {} stream for {}",
+                config.live_quality,
+                camera.display_name()
+            )
+        })?;
     let url = protect::fixup_stream_url(&url, client.hostname())?;
     // The player lives on in its own process group after we exit.
     let mut player = spawn_player(&config.player, title, &url, Stdio::null())?;
-    let Some(pid) = player.id() else { return Ok(()) };
+    let Some(pid) = player.id() else {
+        return Ok(());
+    };
     tokio::select! {
         () = focus_when_mapped(pid) => Ok(()),
         status = player.wait() => match status {
@@ -140,7 +163,10 @@ fn spawn_player(player: &[String], title: &str, target: &str, stdin: Stdio) -> R
     let (program, args) = player.split_first().context("`player` is empty")?;
     let mut command = Command::new(program);
     command.args(args);
-    if Path::new(program).file_name().is_some_and(|name| name == "mpv") {
+    if Path::new(program)
+        .file_name()
+        .is_some_and(|name| name == "mpv")
+    {
         command.arg(format!("--title={title}"));
     }
     command
@@ -188,7 +214,9 @@ impl Demux {
                 self.parts.iter_mut().for_each(Vec::clear);
                 return;
             }
-            let Some(payload) = self.pending.get(offset + 4..offset + 4 + length) else { break };
+            let Some(payload) = self.pending.get(offset + 4..offset + 4 + length) else {
+                break;
+            };
             match kind {
                 frame::INIT if !self.init_sent => {
                     out.extend_from_slice(payload);
@@ -213,5 +241,106 @@ impl Demux {
             offset += 4 + length;
         }
         self.pending.drain(..offset);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let length = (payload.len() as u32).to_be_bytes();
+        [&[kind], &length[1..], payload].concat()
+    }
+
+    /// A media segment whose frames arrive in a different order than they must be written.
+    fn segment(tag: &str) -> Vec<u8> {
+        [
+            frame(frame::BEGIN, b""),
+            frame(frame::TIMESTAMP, b"\x00\x00\x00\x2a"),
+            frame(frame::AUDIO, format!("audio{tag}").as_bytes()),
+            frame(frame::VIDEO, format!("video{tag}").as_bytes()),
+            frame(frame::MDAT, format!("mdat{tag}").as_bytes()),
+            frame(frame::MOOF, format!("moof{tag}").as_bytes()),
+            frame(frame::END, b""),
+        ]
+        .concat()
+    }
+
+    fn demux(messages: &[&[u8]]) -> Vec<u8> {
+        let mut demux = Demux::default();
+        let mut out = Vec::new();
+        for message in messages {
+            demux.push(message, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn writes_init_then_each_segment_as_moof_mdat_video_audio() {
+        let stream = [frame(frame::INIT, b"INIT"), segment("1"), segment("2")].concat();
+        assert_eq!(
+            demux(&[&stream]),
+            b"INITmoof1mdat1video1audio1moof2mdat2video2audio2"
+        );
+    }
+
+    #[test]
+    fn frames_may_span_websocket_messages() {
+        let stream = [frame(frame::INIT, b"INIT"), segment("1"), segment("2")].concat();
+        let whole = demux(&[&stream]);
+        for size in [1, 3, 5, 17] {
+            let messages: Vec<&[u8]> = stream.chunks(size).collect();
+            assert_eq!(demux(&messages), whole, "chunks of {size}");
+        }
+
+        // Nothing is written until the segment's end frame is complete.
+        let (head, tail) = stream.split_at(stream.len() - 5);
+        let mut demuxer = Demux::default();
+        let mut out = Vec::new();
+        demuxer.push(head, &mut out);
+        assert_eq!(out, b"INITmoof1mdat1video1audio1");
+        demuxer.push(tail, &mut out);
+        assert_eq!(out, whole);
+    }
+
+    #[test]
+    fn init_is_written_once_and_media_waits_for_it() {
+        let stream = [
+            segment("0"),
+            frame(frame::INIT, b"INIT"),
+            segment("1"),
+            frame(frame::INIT, b"AGAIN"),
+            segment("2"),
+        ]
+        .concat();
+        assert_eq!(
+            demux(&[&stream]),
+            b"INITmoof1mdat1video1audio1moof2mdat2video2audio2"
+        );
+    }
+
+    #[test]
+    fn begin_discards_a_partial_segment_and_unknown_frames_are_skipped() {
+        let stream = [
+            frame(frame::INIT, b"INIT"),
+            frame(frame::MOOF, b"stale"),
+            frame(248, b"avc1.640028"),
+            segment("1"),
+        ]
+        .concat();
+        assert_eq!(demux(&[&stream]), b"INITmoof1mdat1video1audio1");
+    }
+
+    #[test]
+    fn lost_sync_drops_the_message_and_recovers_on_the_next() {
+        // Not a frame type: its "length" would otherwise stall the stream waiting for 16 MiB.
+        let garbage = [
+            frame(frame::MOOF, b"half"),
+            vec![0x01, 0xff, 0xff, 0xff, 0x00],
+        ]
+        .concat();
+        let out = demux(&[&frame(frame::INIT, b"INIT"), &garbage, &segment("1")]);
+        assert_eq!(out, b"INITmoof1mdat1video1audio1");
     }
 }
