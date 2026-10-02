@@ -241,6 +241,8 @@ impl Protect {
         http_tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(http_tls)
+            // Never follow redirects: they would carry X-API-KEY (and login bodies) past the pinned console.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
@@ -480,6 +482,10 @@ fn console_id(host: &str) -> Result<String> {
 /// Strips `?enableSrtp` and points the URL at the configured console, keeping its port.
 pub fn fixup_stream_url(url: &str, hostname: &str) -> Result<String> {
     let mut url = Url::parse(url).with_context(|| format!("invalid stream URL {url:?}"))?;
+    // The URL goes straight to the player, which would open anything (files, other protocols).
+    if !matches!(url.scheme(), "rtsps" | "rtsp") {
+        bail!("stream URL must be rtsps:// or rtsp://");
+    }
     url.set_host(Some(hostname))
         .with_context(|| format!("cannot set stream host to {hostname}"))?;
     let query: Vec<(String, String)> = url
@@ -765,6 +771,49 @@ mod tests {
         );
     }
 
+    /// A redirect must never carry the API key to another destination.
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let console = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let console_addr = console.local_addr().unwrap();
+
+        let redirect = tokio::spawn(async move {
+            let (mut socket, _) = console.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_addr}/\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config = Config {
+            host: format!("http://{console_addr}"),
+            fallback_hosts: Vec::new(),
+            cert_sha256: None,
+            api_key: "secret-key".to_owned(),
+            username: String::new(),
+            live_quality: String::new(),
+            player: Vec::new(),
+            event_log: None,
+        };
+        let protect = Protect::new(&config, &config.host).unwrap();
+
+        let err = protect.alive().await.unwrap_err();
+        let http = err.downcast_ref::<HttpError>().expect("an HTTP error");
+        assert_eq!(http.status, StatusCode::TEMPORARY_REDIRECT);
+        redirect.await.unwrap();
+
+        let followed = tokio::time::timeout(Duration::from_millis(200), target.accept()).await;
+        assert!(followed.is_err(), "the redirect target was contacted");
+    }
+
     #[test]
     fn base_url_rejects_other_schemes_and_garbage() {
         assert!(
@@ -781,6 +830,13 @@ mod tests {
             console_id("https://unifi.example:7443/proxy/protect/integration").unwrap(),
             "unifi.example:7443"
         );
+    }
+
+    #[test]
+    fn stream_url_must_be_rtsp() {
+        for url in ["file:///etc/passwd", "http://10.0.0.5/x", "-i"] {
+            assert!(fixup_stream_url(url, "192.0.2.10").is_err(), "{url}");
+        }
     }
 
     #[test]
