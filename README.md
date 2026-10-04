@@ -235,6 +235,8 @@ live_quality = "high"     # high | medium | low
 player = ["mpv", "--profile=low-latency", "--untimed", "--no-cache", "--force-window=immediate"]
 ```
 
+Sauron hands `mpv` the camera's stream address on stdin, so the access token in it never appears in the process list. A different `player` gets the address as a command-line argument, which other users on the machine can read while it runs.
+
 If your console has a certificate from a public authority (for example on your own domain), leave `cert_sha256` out and Sauron verifies it normally.
 
 ## Troubleshooting
