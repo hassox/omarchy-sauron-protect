@@ -70,7 +70,7 @@ async fn instant(config: &Config, client: &Protect, camera: &Camera, title: &str
     .await
     .map_err(|err| anyhow!("livestream websocket: {err}"))?;
 
-    let mut player = spawn_player(&config.player, title, "-", Stdio::piped())?;
+    let mut player = spawn_player(&config.player, title, Source::Video).await?;
     let mut stdin = player.stdin.take().context("player has no stdin")?;
     let focus = player.id().map(|pid| tokio::spawn(focus_when_mapped(pid)));
 
@@ -139,7 +139,7 @@ async fn rtsps(config: &Config, client: &Protect, camera: &Camera, title: &str) 
         })?;
     let url = protect::fixup_stream_url(&url, client.hostname())?;
     // The player lives on in its own process group after we exit.
-    let mut player = spawn_player(&config.player, title, &url, Stdio::null())?;
+    let mut player = spawn_player(&config.player, title, Source::Url(&url)).await?;
     let Some(pid) = player.id() else {
         return Ok(());
     };
@@ -158,25 +158,69 @@ async fn focus_when_mapped(pid: u32) {
     }
 }
 
-/// Spawns the configured player for `target` (a URL, or `-` for stdin) in its own process group.
-fn spawn_player(player: &[String], title: &str, target: &str, stdin: Stdio) -> Result<Child> {
+/// What the player is given to play.
+enum Source<'a> {
+    /// Fragmented MP4 written to the player's stdin.
+    Video,
+    /// A stream URL. It carries the camera's access token, so it must not appear in the player's
+    /// command line, which any local user can read.
+    Url(&'a str),
+}
+
+/// The player's command: for `mpv`, a URL goes in as a one-line playlist on stdin
+/// (`--playlist=-`). Other players have no such convention, so they get it as an argument.
+fn player_command(player: &[String], title: &str, source: &Source) -> Result<(Command, bool)> {
     let (program, args) = player.split_first().context("`player` is empty")?;
     let mut command = Command::new(program);
     command.args(args);
-    if Path::new(program)
+    let is_mpv = Path::new(program)
         .file_name()
-        .is_some_and(|name| name == "mpv")
-    {
+        .is_some_and(|name| name == "mpv");
+    if is_mpv {
         command.arg(format!("--title={title}"));
     }
-    command
-        .arg(target)
+    let url_on_stdin = match source {
+        Source::Video => {
+            command.arg("-");
+            false
+        }
+        Source::Url(_) if is_mpv => {
+            command.arg("--playlist=-");
+            true
+        }
+        Source::Url(url) => {
+            command.arg(url);
+            false
+        }
+    };
+    Ok((command, url_on_stdin))
+}
+
+/// Spawns the configured player in its own process group. With `Source::Video` its stdin is
+/// piped for the caller to feed.
+async fn spawn_player(player: &[String], title: &str, source: Source<'_>) -> Result<Child> {
+    let (mut command, url_on_stdin) = player_command(player, title, &source)?;
+    let stdin = match source {
+        Source::Video => Stdio::piped(),
+        Source::Url(_) if url_on_stdin => Stdio::piped(),
+        Source::Url(_) => Stdio::null(),
+    };
+    let mut child = command
         .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
-        .with_context(|| format!("cannot start player `{program}`"))
+        .with_context(|| format!("cannot start player `{}`", player[0]))?;
+    if let (true, Source::Url(url)) = (url_on_stdin, &source) {
+        let mut stdin = child.stdin.take().context("player has no stdin")?;
+        // One short line: far below the pipe buffer, so this cannot block.
+        stdin
+            .write_all(format!("{url}\n").as_bytes())
+            .await
+            .context("cannot pass the stream to the player")?;
+    }
+    Ok(child)
 }
 
 /// Protect livestream frame types: each frame is `[type u8][length u24 BE][payload]`, and frames
@@ -342,5 +386,44 @@ mod tests {
         .concat();
         let out = demux(&[&frame(frame::INIT, b"INIT"), &garbage, &segment("1")]);
         assert_eq!(out, b"INITmoof1mdat1video1audio1");
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    const URL: &str = "rtsps://192.0.2.10:7441/aBcToKeN123";
+
+    #[test]
+    fn mpv_gets_the_stream_url_on_stdin_not_in_its_arguments() {
+        let player = ["mpv", "--untimed"].map(String::from);
+        let (command, url_on_stdin) = player_command(&player, "Sauron", &Source::Url(URL)).unwrap();
+        assert!(url_on_stdin);
+        let args = args(&command);
+        assert!(
+            args.iter().all(|arg| !arg.contains("aBcToKeN123")),
+            "{args:?}"
+        );
+        assert!(args.contains(&"--playlist=-".to_owned()));
+    }
+
+    #[test]
+    fn other_players_get_the_url_as_an_argument() {
+        let player = ["vlc"].map(String::from);
+        let (command, url_on_stdin) = player_command(&player, "Sauron", &Source::Url(URL)).unwrap();
+        assert!(!url_on_stdin);
+        assert_eq!(args(&command), [URL]);
+    }
+
+    #[test]
+    fn livestream_video_is_read_from_stdin() {
+        let player = ["mpv"].map(String::from);
+        let (command, url_on_stdin) = player_command(&player, "Sauron", &Source::Video).unwrap();
+        assert!(!url_on_stdin);
+        assert_eq!(args(&command), ["--title=Sauron", "-"]);
     }
 }
