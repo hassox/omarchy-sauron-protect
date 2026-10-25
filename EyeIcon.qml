@@ -25,23 +25,23 @@ Item {
   implicitHeight: iconSize
 
   property real lid: openness
-  Behavior on lid { NumberAnimation { duration: Style.duration(360); easing.type: Easing.InOutCubic } }
+  Behavior on lid { NumberAnimation { duration: 360; easing.type: Easing.InOutCubic } }
 
   property real dilation: wary ? 1 : 0
-  Behavior on dilation { NumberAnimation { duration: Style.duration(420); easing.type: Easing.OutCubic } }
+  Behavior on dilation { NumberAnimation { duration: 420; easing.type: Easing.OutCubic } }
 
   // Two unsynchronised drifts keep the flames from looking like a metronome.
   property real flame: 0
   property real drift: 0
   SequentialAnimation on flame {
-    running: root.seeing && !Style.reduceMotion
+    running: root.seeing
     loops: Animation.Infinite
     onRunningChanged: if (!running) root.flame = 0
     NumberAnimation { to: 1; duration: 540; easing.type: Easing.InOutSine }
     NumberAnimation { to: 0.2; duration: 760; easing.type: Easing.InOutSine }
   }
   SequentialAnimation on drift {
-    running: root.seeing && !Style.reduceMotion
+    running: root.seeing
     loops: Animation.Infinite
     onRunningChanged: if (!running) root.drift = 0
     NumberAnimation { to: 1; duration: 1300; easing.type: Easing.InOutSine }
