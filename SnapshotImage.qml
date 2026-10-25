@@ -34,7 +34,7 @@ Item {
     id: fadeIn
     property: "opacity"
     to: 1
-    duration: Style.duration(220)
+    duration: 220
     easing.type: Easing.OutCubic
   }
 

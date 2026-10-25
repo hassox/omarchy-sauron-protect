@@ -437,7 +437,7 @@ Item {
     onLoadFailed: root.dnd = false
   }
 
-  ShellIpc {
+  IpcHandler {
     target: "sauron"
 
     function toggle(): void { if (root.shell) root.shell.toggle(root.pluginId, "{}") }

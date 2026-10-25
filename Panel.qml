@@ -548,7 +548,7 @@ Panel {
 
     property real pulse: 1
     SequentialAnimation on pulse {
-      running: tile.hot && root.eyeSeeing && root.opened && !Style.reduceMotion
+      running: tile.hot && root.eyeSeeing && root.opened
       loops: Animation.Infinite
       onRunningChanged: if (!running) tile.pulse = 1
       NumberAnimation { to: 0.45; duration: 640; easing.type: Easing.InOutSine }
