@@ -24,47 +24,41 @@ Sauron puts Barad-dûr in your status bar. When a camera sees something you care
 
 - **Omarchy** with its built-in bar (`omarchy-shell`).
 - **A UniFi OS console running UniFi Protect 5.3 or newer** (Cloud Key, Dream Machine, NVR, …), reachable from your machine.
-- **Rust**, to build the Sauron daemon. If you don't have it, run `omarchy install dev-env rust`.
 
-Everything else Sauron uses (`mpv`, `gum`, GNOME Keyring) ships with Omarchy.
+Everything Sauron uses (Python 3.11 or newer, `mpv`, GNOME Keyring) ships with Omarchy. There is nothing to build or install: Sauron runs from the plugin folder.
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/hassox/omarchy-sauron-protect
-~/.config/omarchy/plugins/sauron/install.sh
+omarchy plugin add https://github.com/hassox/omarchy-sauron-protect --enable
 ```
 
-The install script:
-
-1. Builds the daemon.
-2. Installs it to `~/.local/bin/sauron`.
-3. Puts the eye on the right of your bar.
-4. On first install, starts the setup wizard.
-
-To update, run `omarchy plugin update sauron`, then run `install.sh` again so the daemon matches the plugin.
+The eye appears on the right of your bar. Click it to [set it up](#set-up). To update, run `omarchy plugin update sauron`.
 
 ### Uninstall
 
 ```bash
 omarchy plugin remove sauron                 # takes the eye off the bar and deletes the plugin
-rm ~/.local/bin/sauron                       # the daemon
-rm -r ~/.config/sauron ~/.cache/sauron       # config (holds your API key) and build files
+rm -r ~/.config/sauron                       # config (holds your API key)
 secret-tool clear application sauron        # the service account's password, if you set one up
 ```
+
+Versions before 0.3 also built a daemon: remove `~/.local/bin/sauron` and `~/.cache/sauron` too.
 
 If you turned on the [event log](#event-log-and-history), delete that file too. In UniFi, you can then delete Sauron's API key (**Protect › Settings › Control Plane › Integrations**) and its service account (**Admins & Users**).
 
 ## Set up
 
-Run `sauron setup`, or click the eye and then **Set up**. The wizard asks for:
+Click the eye. Until Sauron is connected, the panel opens on its connect form:
 
-1. **Your console's address.** It suggests your network's gateway, which is usually the console. Sauron then shows the console's certificate and asks you to trust it (see [Away from home](#away-from-home)).
+1. **Your console's address.** It suggests your network's gateway, which is usually the console. Click **Find**. If the console's certificate isn't from a public authority (most aren't), Sauron shows its fingerprint; turn on **Trust this console** (see [Away from home](#away-from-home)).
 2. **A Protect API key.** Create one in UniFi Protect under **Settings › Control Plane › Integrations › Create API Key**.
 3. **Other addresses (optional).** How the console can be reached when you're not at home, such as its Tailscale name.
 4. **Instant live video (optional).** See below.
 
-Re-run `sauron setup` any time to change something; your current answers are the defaults. The eye picks up the changes within a few seconds.
+Click **Save**. Sauron checks everything against your console first (the key, each other address, the instant-live login) and saves only when it all works. The eye opens a few seconds later.
+
+To change something later, click **Console settings** at the bottom of the panel. Leave the key or password empty to keep the saved one.
 
 ### Instant live video (optional)
 
@@ -77,18 +71,18 @@ The Protect app starts feeds almost instantly with a different stream that needs
 3. Give it the **View Only** role for Protect.
 4. Leave multi-factor authentication off.
 
-Then enter its username and password in `sauron setup`. The password is stored in your GNOME keyring, not in a file. If that stream ever fails, Sauron falls back to RTSPS.
+Then turn on **Instant live video** in the connect form and enter its username and password. The password is stored in your GNOME keyring, not in a file. If that stream ever fails, Sauron falls back to RTSPS.
 
 ### Away from home
 
 Sauron needs to reach your console, so away from home it needs a way back to your network:
 
-- **Tailscale.** Run a [subnet router](https://tailscale.com/kb/1019/subnets) at home that advertises your home network, and run `tailscale up --accept-routes` on your laptop. Your console's usual address then works from anywhere. If you reach the console under a different name or IP instead, add it under **Other addresses** in `sauron setup`.
+- **Tailscale.** Run a [subnet router](https://tailscale.com/kb/1019/subnets) at home that advertises your home network, and run `tailscale up --accept-routes` on your laptop. Your console's usual address then works from anywhere. If you reach the console under a different name or IP instead, add it under **Other addresses** in the connect form.
 - **UniFi's WireGuard VPN.** In UniFi Network, go to **Settings › VPN › VPN Server**, create a WireGuard server, and import its client file with `nmcli connection import type wireguard file <file>.conf`. (UniFi Teleport also uses WireGuard, but it has no Linux app.)
 
 Without either, the eye shows **Can't reach your console**. It reconnects on its own within a few seconds of your network changing or a VPN connecting, or you can click **Retry**. Detections that happen while you're disconnected aren't recorded, because Protect keeps no history for Sauron to fetch.
 
-**Your credentials only go to your console.** During setup, Sauron records your console's certificate. From then on it won't talk to anything that presents a different certificate: a café router that happens to use the same address as your console gets a failed connection, never your API key or password. If your console's certificate ever changes, re-run `sauron setup` from home.
+**Your credentials only go to your console.** During setup, Sauron records your console's certificate. From then on it won't talk to anything that presents a different certificate: a café router that happens to use the same address as your console gets a failed connection, never your API key or password. If your console's certificate ever changes, open **Console settings** from home and trust the new one.
 
 ## Use
 
@@ -141,8 +135,13 @@ Live feeds open in `mpv`, one window per camera. Opening a camera that's already
 
 ### Keybinds and scripts
 
+The `sauron` command lives in the plugin folder. To use it from a terminal, link it onto your PATH:
+
 ```bash
-sauron setup                      # set up or change the console, API key, and service account
+ln -s ~/.config/omarchy/plugins/sauron/bin/sauron ~/.local/bin/sauron
+```
+
+```bash
 sauron check                      # test the connection and list cameras
 sauron cameras                    # list cameras
 sauron live "front door"          # open a live feed (camera id, name, or unique prefix)
@@ -154,6 +153,7 @@ omarchy-shell sauron latest       # live feed of the latest detection
 omarchy-shell sauron silence 60   # silence for 60 minutes (0 = until woken)
 omarchy-shell sauron resume       # wake the eye
 omarchy-shell sauron status       # connection status
+omarchy-shell sauron setup        # open the panel on the connect form
 ```
 
 Bind any of these in `~/.config/hypr/bindings.lua`.
@@ -222,12 +222,12 @@ omarchy bar set sauron notify '["person","ring"]' --json
 omarchy bar set sauron recentSightings 10 --json
 ```
 
-Connection settings live in `~/.config/sauron/config.toml`, which `sauron setup` writes:
+Connection settings live in `~/.config/sauron/config.toml`, which the connect form writes:
 
 ```toml
 host = "192.168.1.1"      # your UniFi console at home
 fallback_hosts = []       # other addresses for the same console, e.g. ["unifi.tail1234.ts.net"]
-cert_sha256 = "AB:CD:…"   # the console's certificate, recorded by sauron setup
+cert_sha256 = "AB:CD:…"   # the console's certificate, recorded by the connect form
 api_key = "…"             # or api_key_command = "secret-tool lookup service sauron"
 username = "sauron"       # service account for instant live; its password is in your keyring
 event_log = ""            # append camera events here as JSON Lines, e.g. "~/.local/state/sauron/events.jsonl"
@@ -245,8 +245,8 @@ If your console has a certificate from a public authority (for example on your o
 - **Check the connection** with `sauron check`, which prints the Protect version and every camera, or with `omarchy-shell sauron status`.
 - **Read the logs** with `journalctl --user -g 'sauron:'`.
 - **Live video takes a few seconds to start.** Set up [instant live video](#instant-live-video-optional).
-- **Instant live keeps falling back.** Re-run `sauron setup` and re-enter the service account. Sauron pauses its logins for 15 minutes after a rejected password so it can't get the account locked out.
-- **"Can't reach your console" at home.** If the panel says the address is *not your console*, the console's certificate has changed; re-run `sauron setup`.
+- **Instant live keeps falling back.** Open **Console settings** and re-enter the service account. Sauron pauses its logins for 15 minutes after a rejected password so it can't get the account locked out.
+- **"Can't reach your console" at home.** If the panel says the address is *not your console*, the console's certificate has changed; open **Console settings** and trust the new one.
 
 ## How it works
 
@@ -258,29 +258,33 @@ UniFi Protect ──websockets + REST──▶ sauron watch ──JSON lines─�
 UniFi Protect ──livestream or RTSPS──▶ sauron live ──▶ mpv
 ```
 
-- **`sauron watch`** is a small, single-threaded Rust daemon (`daemon/`). It keeps two websockets open to Protect's official Integration API, one for detections and one for camera status, so alerts arrive as soon as Protect reports them. It fetches snapshots only while the panel is open or a detection fires, and sends the notifications.
+- **`sauron watch`** is a small asyncio Python daemon (`sauron/`, run by `bin/sauron`). It keeps two websockets open to Protect's official Integration API, one for detections and one for camera status, so alerts arrive as soon as Protect reports them. It fetches snapshots only while the panel is open or a detection fires, and sends the notifications.
 - **`Service.qml`** runs the daemon inside Omarchy's shell and holds the state.
 - **`Panel.qml`** draws the eye and the panel on every monitor.
 - **`sauron live`** plays one camera: Protect's livestream when a service account is set up, RTSPS otherwise.
 
 ## Development
 
-`daemon/examples/mock_protect.rs` is a fake Protect console. It has five cameras, snapshots, live video, detections on a timer, and a UniFi login. Its API key is `mock`, and its service account is `sauron` with password `mock`.
+The daemon is plain Python 3.11+ using only the standard library, plus two vendored, pure-Python protocol libraries (`websockets` and `h11`, see [`sauron/_vendor/README.md`](sauron/_vendor/README.md)). Run the tests from the repository root:
 
 ```bash
-cd daemon
-cargo run --release --example mock_protect -- --port 7447 --interval 20 --scenes path/to/photos
+python3 -m unittest discover -s tests -t .
+```
+
+They include end-to-end runs of the daemon against `tools/mock_protect.py`, a fake Protect console served over real TLS. You can also run it by hand. It has five cameras, snapshots, detections, a UniFi login and placeholder livestream frames. Its API key is `mock`, and its service account is `sauron` with password `mock`.
+
+```bash
+python3 tools/mock_protect.py --port 7447 --interval 20 --scenes path/to/photos
 curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'
 ```
 
-- **Connect to it** with `sauron setup`, using the address `http://127.0.0.1:7447`.
-- **Real-looking cameras:** `--scenes` shows `front-door.jpg`, `driveway.jpg`, `backyard.jpg`, `garage.jpg`, and `side-gate.jpg` from that folder instead of test patterns.
-- **After editing QML,** run `omarchy restart shell`.
-- **After editing the daemon,** run `./install.sh`.
+- **Connect to it** from the connect form, using the address `http://127.0.0.1:7447` (or `127.0.0.1:7447` with `--tls`).
+- **Real-looking cameras:** `--scenes` shows `front-door.jpg`, `driveway.jpg`, `backyard.jpg`, `garage.jpg`, and `side-gate.jpg` from that folder instead of a blank picture.
+- **After editing QML,** the shell reloads the plugin on its own; after editing Python, run `omarchy-shell sauron restart`.
 
 ### Releasing
 
-[plugins.omarchy.org](https://plugins.omarchy.org/plugin.html?id=sauron) pins the listing to an approved commit, so pushes alone don't update it. To release, bump `version` in both `manifest.json` and `daemon/Cargo.toml` (CI fails if they differ) and merge to `master`. Once CI passes, the Release workflow tags `vX.Y.Z`, creates a GitHub release, and opens a "Verify and publish a newer upstream commit" request on the marketplace. A marketplace maintainer then approves it.
+[plugins.omarchy.org](https://plugins.omarchy.org/plugin.html?id=sauron) pins the listing to an approved commit, so pushes alone don't update it. To release, bump the version in both `manifest.json` and `sauron/__init__.py` (CI fails if they differ) and merge to `master`. Once CI passes, the Release workflow tags `vX.Y.Z`, creates a GitHub release, and opens a "Verify and publish a newer upstream commit" request on the marketplace. A marketplace maintainer then approves it.
 
 Opening that request needs a `MARKETPLACE_TOKEN` repository secret, because the built-in token can't open issues in another repository. Use a classic personal access token with only the `public_repo` scope; a fine-grained token can't open issues in repositories you don't own. Without the secret, the workflow still releases and prints a link for filing the request by hand. To re-send a request, run the Release workflow manually from the Actions tab.
 

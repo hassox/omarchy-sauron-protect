@@ -35,6 +35,8 @@ Panel {
   readonly property bool dnd: sauron ? sauron.dnd : false
   readonly property bool alerting: sauron ? sauron.alerting : false
   readonly property int unseen: sauron ? sauron.unseen : 0
+  // The connect form replaces the panel's content while it is open.
+  readonly property bool setupOpen: sauron ? sauron.setupOpen : false
 
   // ------------------------------------------------------------ the eye
   readonly property real eyeOpenness: online ? (silenced ? 0.4 : 1) : 0
@@ -55,8 +57,8 @@ Panel {
   // Not connected: one short status line and the one thing that fixes it.
   readonly property string statusTitle: {
     switch (status) {
-    case "missing": return "Daemon not installed"
-    case "outdated": return "Daemon out of date"
+    case "missing": return "Python not found"
+    case "outdated": return "Restart needed"
     case "unconfigured": return "Not set up"
     case "auth": return "API key rejected"
     case "offline": return "Can't reach your console"
@@ -64,9 +66,9 @@ Panel {
     }
   }
   readonly property string actionLabel: {
+    if (setupOpen) return ""
     switch (status) {
-    case "missing": return "Install"
-    case "outdated": return "Update"
+    case "outdated": return "Restart"
     case "unconfigured":
     case "auth": return "Set up"
     case "offline": return "Retry"
@@ -77,7 +79,7 @@ Panel {
   // a network error, or a config the wizard didn't write.
   readonly property string statusDetail: {
     if (!sauron) return ""
-    if (status === "offline") return sauron.message
+    if (status === "offline" || status === "missing") return sauron.message
     if (status === "unconfigured" && sauron.message.indexOf("Not set up") !== 0) return sauron.message
     return ""
   }
@@ -100,10 +102,9 @@ Panel {
 
   function runAction() {
     if (!sauron || actionLabel === "") return
-    if (status === "offline") { sauron.reload(); return }
-    close()
-    if (status === "missing" || status === "outdated") sauron.install()
-    else sauron.setup()
+    if (status === "offline") sauron.reload()
+    else if (status === "outdated") sauron.restart()
+    else sauron.openSetup()
   }
 
   // ------------------------------------------------------------ grid geometry
@@ -122,6 +123,7 @@ Panel {
   ]
   readonly property var sections: {
     var list = []
+    if (setupOpen) return list
     if (actionLabel !== "") list.push("action")
     if (online && kinds.length > 0) list.push("kinds")
     if (online) list.push("silence")
@@ -356,6 +358,16 @@ Panel {
             }
           }
 
+          SetupForm {
+            visible: root.setupOpen
+            width: parent.width
+            sauron: root.sauron
+            foreground: root.foreground
+            dim: root.dim
+            urgent: root.urgent
+            fontFamily: root.fontFamily
+          }
+
           Column {
             visible: root.actionLabel !== ""
             width: parent.width
@@ -471,13 +483,13 @@ Panel {
 
           // ---------- Cameras ----------
           PanelSeparator {
-            visible: root.online && root.cameras.length > 0
+            visible: root.sections.indexOf("tiles") >= 0
             foreground: root.foreground
           }
 
           Grid {
             id: grid
-            visible: root.online && root.cameras.length > 0
+            visible: root.sections.indexOf("tiles") >= 0
             columns: root.columns
             spacing: root.gridGap
 
@@ -488,7 +500,7 @@ Panel {
           }
 
           Text {
-            visible: root.online && root.cameras.length === 0
+            visible: !root.setupOpen && root.online && root.cameras.length === 0
             width: parent.width
             textFormat: Text.PlainText
             text: "No cameras are adopted in Protect yet."
@@ -498,7 +510,7 @@ Panel {
           }
 
           Text {
-            visible: root.sauron && root.sauron.liveError !== ""
+            visible: !root.setupOpen && root.sauron && root.sauron.liveError !== ""
             width: parent.width
             textFormat: Text.PlainText
             text: root.sauron ? root.sauron.liveError : ""
@@ -510,12 +522,12 @@ Panel {
 
           // ---------- Recent ----------
           PanelSeparator {
-            visible: root.recent.length > 0
+            visible: root.sections.indexOf("events") >= 0
             foreground: root.foreground
           }
 
           Column {
-            visible: root.recent.length > 0
+            visible: root.sections.indexOf("events") >= 0
             width: parent.width
             spacing: Style.spacing.xs
 
@@ -529,6 +541,16 @@ Panel {
               model: root.recent
               delegate: EventRow {}
             }
+          }
+
+          Button {
+            visible: root.online && !root.setupOpen
+            text: "Console settings"
+            bordered: true
+            foreground: root.dim
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: if (root.sauron) root.sauron.openSetup()
           }
         }
       }

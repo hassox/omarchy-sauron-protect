@@ -4,9 +4,10 @@ import Quickshell.Io
 import qs.Commons
 import "Kinds.js" as Kinds
 
-// The long-lived half of the plugin. Owns the `sauron watch` daemon, mirrors
-// its JSON-lines stream into bindable state, and feeds bar settings, silence
-// and panel visibility back to it. One instance serves every monitor's widget.
+// The long-lived half of the plugin. Owns the `sauron watch` daemon (Python,
+// run straight from this folder), mirrors its JSON-lines stream into bindable
+// state, and feeds bar settings, silence, panel visibility and setup back to it.
+// One instance serves every monitor's widget.
 Item {
   id: root
 
@@ -14,10 +15,10 @@ Item {
   property var manifest: null
 
   readonly property string pluginId: "sauron"
-  readonly property int protocol: 1
+  readonly property int protocol: 2
   readonly property string home: Quickshell.env("HOME")
-  readonly property string binary: home + "/.local/bin/sauron"
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")).replace(/\/$/, "")
+  readonly property string program: pluginDir + "/bin/sauron"
 
   // ------------------------------------------------------------ settings
   // They live in this widget's entry in shell.json. The shell hands plugin
@@ -45,6 +46,7 @@ Item {
 
   // ------------------------------------------------------------ daemon state
   // starting | missing | unconfigured | connecting | online | offline | auth | outdated
+  // (missing: no usable Python 3.11+)
   property string status: "starting"
   property string message: ""
   property string protectVersion: ""
@@ -59,6 +61,15 @@ Item {
   property string lastAlertCamera: ""
   property string liveError: ""
   property var watchers: ({})
+
+  // ------------------------------------------------------------ setup
+  // The panel's connect form. Each step's latest reply from the daemon; the
+  // API key and password only ever travel from the form to the daemon.
+  property bool setupOpen: false
+  property string setupBusy: ""      // "" | load | probe | save
+  property var setupLoaded: null
+  property var setupProbe: null
+  property var setupSaved: null
 
   readonly property bool online: status === "online"
   readonly property bool watching: Object.keys(watchers).length > 0
@@ -186,17 +197,51 @@ Item {
     send({ cmd: "reload" })
   }
 
-  // Interactive steps run in Omarchy's floating terminal, like its own setup actions.
-  function runInTerminal(command) {
-    Util.execArgv(["omarchy-launch-floating-terminal-with-presentation", command])
-  }
-
+  // Opens the panel on the connect form.
   function setup() {
-    runInTerminal(Util.shellQuote(binary) + " setup")
+    openSetup()
+    if (shell) shell.toggle(pluginId, "{}")
   }
 
-  function install() {
-    runInTerminal(Util.shellQuote(pluginDir + "/install.sh"))
+  function openSetup() {
+    setupProbe = null
+    setupSaved = null
+    setupOpen = true
+    setupStep("load", {})
+  }
+
+  function closeSetup() {
+    setupOpen = false
+    setupProbe = null
+    setupSaved = null
+  }
+
+  function setupStep(op, fields) {
+    if (!daemon.running) return
+    var command = { cmd: "setup." + op }
+    for (var k in fields) command[k] = fields[k]
+    setupBusy = op
+    send(command)
+  }
+
+  function probeConsole(host) {
+    setupSaved = null
+    setupStep("probe", { host: host })
+  }
+
+  // fields: host, pin, apiKey, fallbacks, username, password
+  function saveSetup(fields) {
+    setupStep("save", fields)
+  }
+
+  function handleSetup(msg) {
+    if (setupBusy === msg.op) setupBusy = ""
+    if (msg.op === "load") setupLoaded = msg
+    else if (msg.op === "probe") setupProbe = msg
+    else if (msg.op === "save") {
+      setupSaved = msg
+      if (msg.ok) setupOpen = false
+    }
   }
 
   function updateSettings(patch) {
@@ -263,7 +308,7 @@ Item {
     case "hello":
       daemonVersion = String(msg.version || "")
       if (msg.protocol !== protocol) {
-        setState("outdated", "Daemon " + daemonVersion + " speaks protocol " + msg.protocol + "; rebuild it with install.sh")
+        setState("outdated", "Daemon " + daemonVersion + " speaks protocol " + msg.protocol + "; restart the shell")
         return
       }
       pushFilter()
@@ -274,6 +319,11 @@ Item {
       via = msg.via ? String(msg.via) : ""
       setState(String(msg.state), msg.message)
       if (msg.state === "online") _backoff = 2000
+      // Nothing to show until it is set up: open straight onto the form.
+      if (msg.state === "unconfigured" && !setupOpen) openSetup()
+      break
+    case "setup":
+      handleSetup(msg)
       break
     case "cameras":
       handleCameras(msg.cameras || [])
@@ -377,16 +427,17 @@ Item {
 
   // ------------------------------------------------------------ processes
 
+  // Sauron needs nothing but the system Python (3.11+ for asyncio.timeout).
   Process {
     id: probe
-    command: ["test", "-x", root.binary]
+    command: ["python3", "-c", "import sys; sys.exit(sys.version_info < (3, 11))"]
     onExited: function(code) {
       if (code === 0) {
         root.setState("starting", "")
         daemon.running = true
         return
       }
-      root.setState("missing", root.pluginDir + "/install.sh")
+      root.setState("missing", "Sauron needs Python 3.11 or newer: omarchy pkg add python")
       retryTimer.interval = 5000
       retryTimer.restart()
     }
@@ -394,11 +445,11 @@ Item {
 
   Process {
     id: daemon
-    command: [root.binary, "watch"]
+    command: ["python3", root.program, "watch"]
     stdinEnabled: true
     stdout: SplitParser { onRead: function(line) { root.handleLine(line) } }
     stderr: SplitParser { onRead: function(line) { console.warn("sauron: " + line) } }
-    onExited: function(code) { root.daemonExited(code) }
+    onExited: function(code) { root.setupBusy = ""; root.daemonExited(code) }
   }
 
   Timer {

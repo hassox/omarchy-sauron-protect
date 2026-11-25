@@ -15,25 +15,22 @@ jobs:
       - name: Check manifest and daemon versions match
         run: |
           manifest=$(jq -r .version manifest.json)
-          daemon=$(sed -n 's/^version = "\(.*\)"$/\1/p' daemon/Cargo.toml | head -n1)
+          daemon=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' sauron/__init__.py)
           if [ "$manifest" != "$daemon" ]; then
-            echo "::error::manifest.json is $manifest but daemon/Cargo.toml is $daemon"
+            echo "::error::manifest.json is $manifest but sauron/__init__.py is $daemon"
             exit 1
           fi
 
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: daemon
+    strategy:
+      matrix:
+        # The oldest Python Sauron supports, and the newest, which Omarchy ships.
+        python: ["3.11", "3.x"]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: daemon
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+          python-version: ${{ matrix.python }}
+      - run: python -m compileall -q sauron tools tests bin
+      - run: python -m unittest discover -s tests -t . -v
