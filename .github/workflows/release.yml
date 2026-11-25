@@ -1,0 +1,130 @@
+name: Release
+
+# When CI passes on master and manifest.json carries a version that has no tag
+# yet, tag and release it, then ask plugins.omarchy.org to publish that commit.
+# The marketplace pins each listing to an approved commit, so without this
+# request it keeps showing the old version and preview.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Read the plugin version
+        id: meta
+        run: |
+          version=$(jq -r .version manifest.json)
+          id=$(jq -r .id manifest.json)
+          # Both end up in a tag name and an issue body.
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo "::error::Bad version: $version"; exit 1; }
+          [[ $id =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || { echo "::error::Bad plugin id: $id"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      # The marketplace validates against the branch head. If master has moved
+      # on, the CI run for the newer commit will release instead.
+      - name: Check this commit is still the head of master
+        id: head
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)
+          if [ "$head" = "$SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::master is now at $head; skipping $SHA"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag and release
+        id: release
+        if: steps.head.outputs.current == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "::notice::v$VERSION is already released; bump the version in manifest.json and daemon/Cargo.toml to publish a new one"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            gh release create "v$VERSION" --target "$SHA" --title "Sauron $VERSION" --generate-notes
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GITHUB_TOKEN cannot open issues in another repository, so this needs a
+      # token from the plugin owner (see README, "Releasing").
+      - name: Ask the marketplace to publish this commit
+        if: >-
+          steps.head.outputs.current == 'true' &&
+          (steps.release.outputs.created == 'true' || github.event_name == 'workflow_dispatch')
+        env:
+          MARKETPLACE_TOKEN: ${{ secrets.MARKETPLACE_TOKEN }}
+          PLUGIN_ID: ${{ steps.meta.outputs.id }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          MARKETPLACE: omacom/omarchy-plugin-marketplace
+        run: |
+          if [ -z "$MARKETPLACE_TOKEN" ]; then
+            echo "::warning::MARKETPLACE_TOKEN is not set. Request the update by hand: https://github.com/$MARKETPLACE/issues/new?template=verify-plugin.yml (commit $SHA)"
+            exit 0
+          fi
+          export GH_TOKEN=$MARKETPLACE_TOKEN
+
+          existing=$(gh issue list --repo "$MARKETPLACE" --state open --search "$SHA in:body" --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "::notice::Already requested: $existing"
+            exit 0
+          fi
+
+          # Headings and checkbox text must match the marketplace's
+          # verify-plugin.yml form exactly, or its parser rejects the request.
+          cat > "$RUNNER_TEMP/verify.md" <<EOF
+          ### Verification action
+
+          Verify and publish a newer upstream commit
+
+          ### Plugin ID
+
+          $PLUGIN_ID
+
+          ### Repository URL
+
+          https://github.com/$GITHUB_REPOSITORY
+
+          ### Target commit
+
+          $SHA
+
+          ### Verification acknowledgment
+
+          - [x] I understand that only the exact target commit can become a verified marketplace snapshot and that verification is not a security audit.
+
+          ### Standard installation acknowledgment
+
+          - [ ] I confirm that this listed root plugin supports the standard Omarchy installation path and does not require manual setup.
+          EOF
+
+          url=$(gh issue create --repo "$MARKETPLACE" --title "[Verify]: $PLUGIN_ID $VERSION" --body-file "$RUNNER_TEMP/verify.md")
+          echo "::notice::Requested marketplace update: $url"
+          echo "Marketplace update for v$VERSION: $url" >> "$GITHUB_STEP_SUMMARY"

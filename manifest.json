@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "id": "sauron",
-  "name": "Sauron",
-  "version": "0.1.0",
+  "name": "Sauron for UniFi Protect",
+  "version": "0.2.0",
   "author": "Daniel Neighman",
   "license": "MIT",
   "description": "The Eye of Sauron: UniFi Protect detections, a live camera grid, and one-click live feeds in the Omarchy bar.",

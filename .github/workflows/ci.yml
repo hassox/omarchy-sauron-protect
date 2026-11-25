@@ -6,6 +6,21 @@ on:
     branches: [master]
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The marketplace shows the manifest version and the release workflow tags
+      # it, so the daemon must not drift from it.
+      - name: Check manifest and daemon versions match
+        run: |
+          manifest=$(jq -r .version manifest.json)
+          daemon=$(sed -n 's/^version = "\(.*\)"$/\1/p' daemon/Cargo.toml | head -n1)
+          if [ "$manifest" != "$daemon" ]; then
+            echo "::error::manifest.json is $manifest but daemon/Cargo.toml is $daemon"
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     defaults:
