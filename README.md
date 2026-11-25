@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/panel.png" width="560" alt="The Sauron panel: detection filters, silence controls, a live grid of camera snapshots with an active detection, and recent sightings">
+  <img src="preview.png" width="560" alt="The Sauron panel: detection filters, silence controls, a live grid of camera snapshots with an active detection, and recent sightings">
 </p>
 
 Sauron puts Barad-dûr in your status bar. When a camera sees something you care about (a person, a vehicle, a package, the doorbell), the Eye burns, a notification pops up with a snapshot, and one click opens the camera's live feed.
@@ -277,6 +277,14 @@ curl -X POST 'http://127.0.0.1:7447/mock/trigger?camera=Driveway&kind=person'
 - **Real-looking cameras:** `--scenes` shows `front-door.jpg`, `driveway.jpg`, `backyard.jpg`, `garage.jpg`, and `side-gate.jpg` from that folder instead of test patterns.
 - **After editing QML,** run `omarchy restart shell`.
 - **After editing the daemon,** run `./install.sh`.
+
+### Releasing
+
+[plugins.omarchy.org](https://plugins.omarchy.org/plugin.html?id=sauron) pins the listing to an approved commit, so pushes alone don't update it. To release, bump `version` in both `manifest.json` and `daemon/Cargo.toml` (CI fails if they differ) and merge to `master`. Once CI passes, the Release workflow tags `vX.Y.Z`, creates a GitHub release, and opens a "Verify and publish a newer upstream commit" request on the marketplace. A marketplace maintainer then approves it.
+
+Opening that request needs a `MARKETPLACE_TOKEN` repository secret, because the built-in token can't open issues in another repository. Use a classic personal access token with only the `public_repo` scope; a fine-grained token can't open issues in repositories you don't own. Without the secret, the workflow still releases and prints a link for filing the request by hand. To re-send a request, run the Release workflow manually from the Actions tab.
+
+The marketplace card uses `preview.png` from the repository root, which is also the README's panel screenshot.
 
 ## License and credits
 
