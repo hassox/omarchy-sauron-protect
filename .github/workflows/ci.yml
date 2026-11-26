@@ -21,7 +21,7 @@ jobs:
             exit 1
           fi
 
-  test:
+  python:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,3 +34,12 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m compileall -q sauron tools tests bin
       - run: python -m unittest discover -s tests -t . -v
+
+  # Branch protection requires a check named `test`; it passes only when every
+  # Python version above does, so the rule needn't change with the matrix.
+  test:
+    runs-on: ubuntu-latest
+    needs: python
+    if: always()
+    steps:
+      - run: test "${{ needs.python.result }}" = success
