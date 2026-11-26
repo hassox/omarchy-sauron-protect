@@ -14,6 +14,7 @@ from unittest import mock
 
 from tests import fakes, support
 import mock_protect
+import sauron
 from sauron import daemon as daemon_mod
 
 API_KEY = "key-Zq81-secret"
@@ -57,7 +58,7 @@ class SetupFlowTest(unittest.IsolatedAsyncioTestCase):
         return found["cert"]["sha256"]
 
     async def test_starts_unconfigured_and_asks_for_setup(self):
-        self.assertEqual(self.out.messages[0], {"t": "hello", "version": "0.3.0", "protocol": 2})
+        self.assertEqual(self.out.messages[0], {"t": "hello", "version": sauron.VERSION, "protocol": 2})
         status = self.out.of("status")[-1]
         self.assertEqual(status["state"], "unconfigured")
         self.assertIn("panel", status["message"])
