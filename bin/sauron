@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Runs Sauron from the plugin folder with the system Python; nothing to build or install."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from sauron.cli import main  # noqa: E402
+
+sys.exit(main())

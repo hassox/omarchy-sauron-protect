@@ -66,7 +66,7 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           if gh release view "v$VERSION" >/dev/null 2>&1; then
-            echo "::notice::v$VERSION is already released; bump the version in manifest.json and daemon/Cargo.toml to publish a new one"
+            echo "::notice::v$VERSION is already released; bump the version in manifest.json and sauron/__init__.py to publish a new one"
             echo "created=false" >> "$GITHUB_OUTPUT"
           else
             gh release create "v$VERSION" --target "$SHA" --title "Sauron $VERSION" --generate-notes
