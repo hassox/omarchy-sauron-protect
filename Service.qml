@@ -437,7 +437,7 @@ Item {
         daemon.running = true
         return
       }
-      root.setState("missing", "Sauron needs Python 3.11 or newer: omarchy pkg add python")
+      root.setState("missing", "Sauron needs Python 3.11 or newer")
       retryTimer.interval = 5000
       retryTimer.restart()
     }

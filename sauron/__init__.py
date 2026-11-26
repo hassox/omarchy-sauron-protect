@@ -3,7 +3,7 @@
 import os
 import sys
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 # The JSON-lines protocol spoken with Service.qml; bump it when messages change incompatibly.
 PROTOCOL = 2
 
